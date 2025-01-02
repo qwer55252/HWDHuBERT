@@ -82,6 +82,11 @@ class DistillationArguments:
         default=True,
         metadata={"help": "Whether to copy teacher's feature extractor parameters to the student model."}
     )
+    # ---- alpha_cos 추가
+    alpha_cos: float = field(
+        default=0.0,
+        metadata={"help": "Weight for the cos embedding loss between teacher/student hidden states."}
+    )
 # ---- distillation changes END
 # ------------------------------------------------------------------------------------
 
@@ -266,27 +271,59 @@ class DistilCTCTrainer(Trainer):
     """
     Custom Trainer that computes a distillation loss for teacher-student training.
     """
-    def __init__(self, teacher_model=None, student_model=None, temperature=5.0, lambda_param=0.5, *args, **kwargs):
+    def __init__(self, 
+                 teacher_model=None, 
+                 student_model=None, 
+                 temperature=5.0, 
+                 lambda_param=0.5,
+                 alpha_cos=0.0, # ---- alpha_cos 추가
+                 *args, 
+                 **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.teacher = teacher_model
         self.student = student_model
+        
+        # teacher는 gradient 업데이트를 하지 않도록
         self.teacher.to(self.args.device)
         self.teacher.eval()
+        for p in self.teacher.parameters():
+            p.requires_grad = False
+        
         self.temperature = temperature
         self.lambda_param = lambda_param
+        
+        # alpha_cos 및 cosine_loss_fct 초기화
+        self.alpha_cos = alpha_cos
+        self.cosine_loss_fct = nn.CosineEmbeddingLoss(reduction="mean")
+        
+        # KLDivLoss for distillation
         self.loss_function = nn.KLDivLoss(reduction="batchmean")
+        
+        # 예시: Student hidden_state (B, T, 432) → Linear → (B, T, 768)
+        self.student_hidden_size = self.student.config.hidden_size
+        self.teacher_hidden_size = self.teacher.config.hidden_size
+        self.student_projection = nn.Linear(self.student_hidden_size, self.teacher_hidden_size)  # trainable
+        self.student_projection.to(self.args.device)
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Compute the weighted combination of CTC loss (student) and distillation loss (KL divergence)."""
-        # Student forward
-        student_output = model(**inputs)
-        student_logits = student_output.logits
+        
+        # attention_mask가 있는 경우 꺼냄
+        attention_mask = inputs.get("attention_mask", None)
+        
+        # Student forward (hidden_states 반환을 위해 output_hidden_states=True)
+        student_output = model(**inputs, output_hidden_states=True)
+        student_logits = student_output.logits # (batch_size, time_steps, vocab_size)
+        s_hidden_states = student_output.hidden_states  # list 형태로 layer별 hidden states
 
-        # Teacher forward (no gradient)
+
+        # Teacher forward (no gradient, hidden_states 반환)
         with torch.no_grad():
             teacher_input = {k: v for k, v in inputs.items() if k != "labels"}
-            teacher_output = self.teacher(**teacher_input)
+            teacher_output = self.teacher(**teacher_input, output_hidden_states=True)
             teacher_logits = teacher_output.logits
+            t_hidden_states = teacher_output.hidden_states
 
         # Distillation: teacher (soft targets) vs student (soft targets)
         soft_teacher = F.softmax(teacher_logits / self.temperature, dim=-1)
@@ -298,6 +335,36 @@ class DistilCTCTrainer(Trainer):
 
         # Combine them
         loss = (1.0 - self.lambda_param) * student_target_loss + self.lambda_param * distillation_loss
+        
+        # 추가: alpha_cos > 0.0이면, 마지막 hidden_states를 이용한 코사인 임베딩 손실 계산
+        if self.alpha_cos > 0.0:
+            # student/teacher에서 마지막 hidden state를 가져옴
+            # wav2vec2는 마지막이 s_hidden_states[-1], t_hidden_states[-1]
+            s_last_hidden = s_hidden_states[-1]  # (bs, seq_len, student_dim)
+            s_last_hidden_proj = self.student_projection(s_last_hidden)  # (bs, seq_len, teacher_dim)
+            t_last_hidden = t_hidden_states[-1]  # (bs, seq_len, teacher_dim)
+            
+            assert s_last_hidden_proj.size() == t_last_hidden.size()
+
+            if attention_mask is not None:
+                # (bs, seq_len, dim)
+                mask = attention_mask.unsqueeze(-1).expand_as(s_last_hidden_proj)
+                s_hidden_states_slct = torch.masked_select(s_last_hidden_proj, mask.bool())
+                t_hidden_states_slct = torch.masked_select(t_last_hidden, mask.bool())
+                dim = s_last_hidden_proj.size(-1)
+                # 길이가 맞도록 reshape
+                s_hidden_states_slct = s_hidden_states_slct.view(-1, dim)
+                t_hidden_states_slct = t_hidden_states_slct.view(-1, dim)
+            else:
+                # attention_mask가 없을 수도 있으니, 없는 경우 전체를 사용
+                s_hidden_states_slct = s_last_hidden_proj.view(-1, s_last_hidden_proj.size(-1))
+                t_hidden_states_slct = t_last_hidden.view(-1, t_last_hidden.size(-1))
+
+            # 코사인 임베딩 로스를 계산하기 위한 target (1이면 유사해야 함)
+            target = s_hidden_states_slct.new(s_hidden_states_slct.size(0)).fill_(1)
+            loss_cos = self.cosine_loss_fct(s_hidden_states_slct, t_hidden_states_slct, target)
+            loss += self.alpha_cos * loss_cos
+        print(f"loss: {loss} / student_target_loss: {student_target_loss} / distillation_loss: {distillation_loss} / loss_cos: {loss_cos}")
 
         return (loss, student_output) if return_outputs else loss
 # ---- distillation changes END
@@ -543,6 +610,8 @@ def main():
     eval_metrics = {metric: evaluate.load(metric, cache_dir=model_args.cache_dir) for metric in data_args.eval_metrics}
 
     def preprocess_logits_for_metrics(logits, labels):
+        if len(logits) > 1:
+            logits = logits[0]  # logits가 tuple인 경우 첫 번째 요소를 사용, 2 번째 요소는 hidden_state임
         pred_ids = torch.argmax(logits, dim=-1)
         return pred_ids, labels
     
@@ -561,12 +630,6 @@ def main():
 
             # 현재 스텝과 에폭 번호 출력
             current_step = trainer.state.global_step
-            current_epoch = int(trainer.state.epoch) if trainer.state.epoch is not None else "Unknown"
-            print(f"현재 스텝: {current_step}, 현재 에폭: {current_epoch}")
-
-            for i in range(10):  # 10개의 샘플 출력
-                print(f"Prediction: {pred_str[i]}")
-                print(f"Reference: {label_str[i]}")
 
             return {"wer": wer}
         return compute_metrics
@@ -574,7 +637,7 @@ def main():
     
     def compute_metrics(pred):
         pred_ids = pred.predictions[0]
-        pred.label_ids[pred.label_ids == -100] = tokenizer.pad_token_id
+        pred.label_ids[pred.label_ids == tokenizer.pad_token_id] = -100
 
         pred_str = tokenizer.batch_decode(pred_ids)
         # we do not want to group tokens when computing the metrics
@@ -618,6 +681,7 @@ def main():
         eval_dataset=raw_datasets["dev_clean"] if training_args.do_eval else None,
         processing_class=processor,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        alpha_cos=distil_args.alpha_cos,  # ---- alpha_cos 추가
     )
     # trainer.compute_metrics = create_compute_metrics(trainer)
     
