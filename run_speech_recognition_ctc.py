@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from datasets import DatasetDict, load_dataset
+from datasets import DatasetDict, load_dataset, DownloadConfig
 from evaluate import load
 
 import transformers
@@ -36,6 +36,7 @@ from transformers import (
 from transformers.trainer_utils import get_last_checkpoint, is_main_process
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
+import wandb
 
 # Will error if the minimal version of Transformers is not installed.
 # check_min_version("4.48.0.dev0")
@@ -82,8 +83,8 @@ class DistillationArguments:
         default=True,
         metadata={"help": "Whether to copy teacher's feature extractor parameters to the student model."}
     )
-    # ---- alpha_cos 추가
-    alpha_cos: float = field(
+    # ---- alpha_mse 추가
+    alpha_mse: float = field(
         default=0.0,
         metadata={"help": "Weight for the cos embedding loss between teacher/student hidden states."}
     )
@@ -142,7 +143,16 @@ class DataTrainingArguments:
     Arguments pertaining to data input for training and eval.
     """
     dataset_name: str = field(
+        default=None,
         metadata={"help": "The dataset name to use from the 'datasets' library."}
+    )
+    data_dir: str = field(
+        default=None,
+        metadata={"help": "Path to the data directory. If not set, will use the dataset_name."}
+    )
+    split_name: str = field(
+        default="clean",
+        metadata={"help": "The dataset split to use."},
     )
     dataset_config_name: str = field( # 안쓰임
         default=None, 
@@ -161,7 +171,7 @@ class DataTrainingArguments:
         metadata={"help": "Name of the column in the dataset that contains the audio data."},
     )
     text_column_name: str = field(
-        default="text",
+        default="label", # "text" -> None
         metadata={"help": "Name of the column in the dataset that contains the text data."},
     )
     overwrite_cache: bool = field(default=False)
@@ -276,7 +286,7 @@ class DistilCTCTrainer(Trainer):
                  student_model=None, 
                  temperature=5.0, 
                  lambda_param=0.5,
-                 alpha_cos=0.0, # ---- alpha_cos 추가
+                 alpha_mse=0.0, # ---- alpha_mse 추가
                  *args, 
                  **kwargs
     ):
@@ -293,9 +303,10 @@ class DistilCTCTrainer(Trainer):
         self.temperature = temperature
         self.lambda_param = lambda_param
         
-        # alpha_cos 및 cosine_loss_fct 초기화
-        self.alpha_cos = alpha_cos
-        self.cosine_loss_fct = nn.CosineEmbeddingLoss(reduction="mean")
+        # alpha_mse 및 cosine_loss_fct 초기화
+        self.alpha_mse = alpha_mse
+        # self.cosine_loss_fct = nn.CosineEmbeddingLoss(reduction="mean")
+        self.mse_loss_fct = nn.MSELoss(reduction="mean")  
         
         # KLDivLoss for distillation
         self.loss_function = nn.KLDivLoss(reduction="batchmean")
@@ -312,61 +323,89 @@ class DistilCTCTrainer(Trainer):
         # attention_mask가 있는 경우 꺼냄
         attention_mask = inputs.get("attention_mask", None)
         
-        # Student forward (hidden_states 반환을 위해 output_hidden_states=True)
+        # 1) Student forward (hidden_states 반환을 위해 output_hidden_states=True)
         student_output = model(**inputs, output_hidden_states=True)
         student_logits = student_output.logits # (batch_size, time_steps, vocab_size)
-        s_hidden_states = student_output.hidden_states  # list 형태로 layer별 hidden states
+        s_hidden_states = student_output.hidden_states  # list of all layer hidden states: [layer0, layer1, ..., layerN]
 
 
-        # Teacher forward (no gradient, hidden_states 반환)
+        # 2) Teacher forward (no gradient, hidden_states 반환)
         with torch.no_grad():
             teacher_input = {k: v for k, v in inputs.items() if k != "labels"}
             teacher_output = self.teacher(**teacher_input, output_hidden_states=True)
             teacher_logits = teacher_output.logits
-            t_hidden_states = teacher_output.hidden_states
+            t_hidden_states = teacher_output.hidden_states # [layer0, layer1, ..., layerN]
 
-        # Distillation: teacher (soft targets) vs student (soft targets)
+        # 3) Logit distillation loss: teacher (soft targets) vs student (soft targets)
         soft_teacher = F.softmax(teacher_logits / self.temperature, dim=-1)
         soft_student = F.log_softmax(student_logits / self.temperature, dim=-1)
         distillation_loss = self.loss_function(soft_student, soft_teacher) * (self.temperature ** 2)
 
-        # Normal supervised CTC loss from the student
+        # 4) Normal supervised CTC loss from the student
         student_target_loss = student_output.loss
 
         # Combine them
         loss = (1.0 - self.lambda_param) * student_target_loss + self.lambda_param * distillation_loss
         
-        # 추가: alpha_cos > 0.0이면, 마지막 hidden_states를 이용한 코사인 임베딩 손실 계산
-        if self.alpha_cos > 0.0:
+        # 추가: alpha_mse > 0.0이면, 마지막 hidden_states를 이용한 코사인 임베딩 손실 계산
+        mse_loss = 0.0
+        if self.alpha_mse > 0.0:
             # student/teacher에서 마지막 hidden state를 가져옴
             # wav2vec2는 마지막이 s_hidden_states[-1], t_hidden_states[-1]
-            s_last_hidden = s_hidden_states[-1]  # (bs, seq_len, student_dim)
-            s_last_hidden_proj = self.student_projection(s_last_hidden)  # (bs, seq_len, teacher_dim)
-            t_last_hidden = t_hidden_states[-1]  # (bs, seq_len, teacher_dim)
             
-            assert s_last_hidden_proj.size() == t_last_hidden.size()
+            ### 이부분 잘못됨
+            num_layers = min(len(s_hidden_states), len(t_hidden_states))
+            
+            sum_loss_mse = 0.0
+            for layer_idx in range(num_layers):
+                s_hid = s_hidden_states[layer_idx]   # (bs, seq_len, student_dim)
+                t_hid = t_hidden_states[layer_idx]   # (bs, seq_len, teacher_dim)
+                assert s_hid.size() == t_hid.size(), (
+                    f"Shape mismatch at layer {layer_idx}: {s_hid.size()} vs {t_hid.size()}"
+                )
 
-            if attention_mask is not None:
-                # (bs, seq_len, dim)
-                mask = attention_mask.unsqueeze(-1).expand_as(s_last_hidden_proj)
-                s_hidden_states_slct = torch.masked_select(s_last_hidden_proj, mask.bool())
-                t_hidden_states_slct = torch.masked_select(t_last_hidden, mask.bool())
-                dim = s_last_hidden_proj.size(-1)
-                # 길이가 맞도록 reshape
-                s_hidden_states_slct = s_hidden_states_slct.view(-1, dim)
-                t_hidden_states_slct = t_hidden_states_slct.view(-1, dim)
-            else:
-                # attention_mask가 없을 수도 있으니, 없는 경우 전체를 사용
-                s_hidden_states_slct = s_last_hidden_proj.view(-1, s_last_hidden_proj.size(-1))
-                t_hidden_states_slct = t_last_hidden.view(-1, t_last_hidden.size(-1))
+                # 마스킹 (attention_mask) 적용
+                if attention_mask is not None:
+                    mask = attention_mask.unsqueeze(-1).expand_as(s_hid)  # (B, T, D)
+                    s_masked = torch.masked_select(s_hid, mask.bool())
+                    t_masked = torch.masked_select(t_hid, mask.bool())
+                    dim = s_hid.size(-1)
 
-            # 코사인 임베딩 로스를 계산하기 위한 target (1이면 유사해야 함)
-            target = s_hidden_states_slct.new(s_hidden_states_slct.size(0)).fill_(1)
-            loss_cos = self.cosine_loss_fct(s_hidden_states_slct, t_hidden_states_slct, target)
-            loss += self.alpha_cos * loss_cos
-        print(f"loss: {loss} / student_target_loss: {student_target_loss} / distillation_loss: {distillation_loss} / loss_cos: {loss_cos}")
+                    s_masked = s_masked.view(-1, dim)
+                    t_masked = t_masked.view(-1, dim)
+                    # MSE Loss
+                    layer_loss = self.mse_loss_fct(s_masked, t_masked)
+
+                else:
+                    B, L, D = s_hid.shape
+                    s_view = s_hid.view(B * L, D)
+                    t_view = t_hid.view(B * L, D)
+
+                    # MSE loss
+                    layer_loss = self.mse_loss_fct(s_view, t_view)
+                
+                sum_loss_mse += layer_loss
+        
+            # 레이어별로 평균을 낼 수도 있고, 그냥 합산할 수도 있음(취향/실험에 따라 다름)
+            mse_loss = sum_loss_mse / float(num_layers)
+
+        # alpha_mse (이름만 동일) 가중치로 최종 로스에 합산
+        loss += self.alpha_mse * mse_loss
+            
+        # print(f"loss: {loss} / student_target_loss: {student_target_loss} / distillation_loss: {distillation_loss} / loss_cos: {loss_cos}")
+
+        if "wandb" in sys.modules:
+            current_step = self.state.global_step
+            wandb.log({
+                "train/total_loss": loss.item(),
+                "train/ctc_loss": student_target_loss.item(),
+                "train/distill_loss": distillation_loss.item(),
+                "train/hidden_state_loss": mse_loss,
+                "train/global_step": current_step,
+            })
 
         return (loss, student_output) if return_outputs else loss
+
 # ---- distillation changes END
 # ------------------------------------------------------------------------------------
 
@@ -511,49 +550,87 @@ def main():
     # ------------------------------------------------------------------------------------
     # 5. Load datasets
     # ------------------------------------------------------------------------------------
+    download_config = DownloadConfig(
+        # timeout=24*3600,          # 24시간 정도로 크게 설정
+        resume_download=True,     # 실패 시 이어받기
+        max_retries=10            # 재시도 횟수 늘리기
+    )
     raw_datasets = DatasetDict()
-    if training_args.do_train:
-        raw_datasets["train"] = load_dataset(
-            data_args.dataset_name,
-            "clean",
-            split=data_args.train_split_name,
-            token=data_args.token,
-            trust_remote_code=data_args.trust_remote_code,
-        )
-        if data_args.max_train_samples is not None:
-            raw_datasets["train"] = raw_datasets["train"].select(range(data_args.max_train_samples))
+    
+    
+    if data_args.data_dir:
+        if training_args.do_train:
+            raw_datasets["train"] = load_dataset(
+                data_args.data_dir,
+                data_args.split_name,
+                split=data_args.train_split_name,
+                token=data_args.token,
+                trust_remote_code=data_args.trust_remote_code,
+                download_config=download_config,
+            )
+            if data_args.max_train_samples is not None:
+                raw_datasets["train"] = raw_datasets["train"].select(range(data_args.max_train_samples))
 
-    if training_args.do_eval:
-        raw_datasets["dev_clean"] = load_dataset(
-            data_args.dataset_name,
-            "clean",
-            split=data_args.eval_split_name,
-            token=data_args.token,
-            trust_remote_code=data_args.trust_remote_code,
-        )
-        if data_args.max_eval_samples is not None:
-            raw_datasets["dev_clean"] = raw_datasets["dev_clean"].select(range(data_args.max_eval_samples))
+        if training_args.do_eval:
+            raw_datasets["dev_clean"] = load_dataset(
+                data_args.data_dir,
+                data_args.split_name,
+                split=data_args.eval_split_name,
+                token=data_args.token,
+                trust_remote_code=data_args.trust_remote_code,
+                download_config=download_config,
+            )
+            if data_args.max_eval_samples is not None:
+                raw_datasets["dev_clean"] = raw_datasets["dev_clean"].select(range(data_args.max_eval_samples))
+        
+    else:
+        if training_args.do_train:
+            raw_datasets["train"] = load_dataset(
+                data_args.dataset_name,
+                data_args.split_name,
+                split=data_args.train_split_name,
+                token=data_args.token,
+                trust_remote_code=data_args.trust_remote_code,
+                download_config=download_config,
+            )
+            if data_args.max_train_samples is not None:
+                raw_datasets["train"] = raw_datasets["train"].select(range(data_args.max_train_samples))
+
+        if training_args.do_eval:
+            raw_datasets["dev_clean"] = load_dataset(
+                data_args.dataset_name,
+                data_args.split_name,
+                split=data_args.eval_split_name,
+                token=data_args.token,
+                trust_remote_code=data_args.trust_remote_code,
+                download_config=download_config,
+            )
+            if data_args.max_eval_samples is not None:
+                raw_datasets["dev_clean"] = raw_datasets["dev_clean"].select(range(data_args.max_eval_samples))
 
     # Remove special chars
     chars_to_ignore_regex = (
         f'[{"".join(data_args.chars_to_ignore)}]' if data_args.chars_to_ignore is not None else None
     )
+    
     text_column_name = data_args.text_column_name
+    if text_column_name is not None:
+    
+        def remove_special_characters(batch):
+            if chars_to_ignore_regex is not None:
+                batch["target_text"] = re.sub(chars_to_ignore_regex, "", batch[text_column_name]).lower() + " "
+            else:
+                # batch["target_text"] = batch[text_column_name].lower() + " "
+                pass
+            return batch
 
-    def remove_special_characters(batch):
-        if chars_to_ignore_regex is not None:
-            batch["target_text"] = re.sub(chars_to_ignore_regex, "", batch[text_column_name]).lower() + " "
-        else:
-            batch["target_text"] = batch[text_column_name].lower() + " "
-        return batch
-
-    with training_args.main_process_first(desc="dataset map special characters removal"):
-        for k in list(raw_datasets.keys()):
-            raw_datasets[k] = raw_datasets[k].map(
-                remove_special_characters,
-                remove_columns=[text_column_name],
-                desc="remove special characters",
-            )
+        with training_args.main_process_first(desc="dataset map special characters removal"):
+            for k in list(raw_datasets.keys()):
+                raw_datasets[k] = raw_datasets[k].map(
+                    remove_special_characters,
+                    remove_columns=[text_column_name],
+                    desc="remove special characters",
+                )
 
     # 6. Possibly create vocabulary from data if no tokenizer is given
     # (skipped here for brevity, or copied from original code snippet)
@@ -681,7 +758,7 @@ def main():
         eval_dataset=raw_datasets["dev_clean"] if training_args.do_eval else None,
         processing_class=processor,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        alpha_cos=distil_args.alpha_cos,  # ---- alpha_cos 추가
+        alpha_mse=distil_args.alpha_mse,  # ---- alpha_mse 추가
     )
     # trainer.compute_metrics = create_compute_metrics(trainer)
     
