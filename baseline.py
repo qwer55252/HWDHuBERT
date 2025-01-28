@@ -198,7 +198,7 @@ model = Wav2Vec2ForCTC.from_pretrained(
 print(f'config: {config}')
 
 # TODO: 주석 remove
-#'''
+'''
 # forward 시, attention을 함께 받아오기
 with torch.no_grad():
     outputs = model(audio_tensor, output_attentions=True)
@@ -416,7 +416,7 @@ prune_wav2vec2_attention(model, heads_to_prune)
 for i, layer in enumerate(model.wav2vec2.encoder.layers):
     attn = layer.attention
     print(f"Layer {i} -> num_heads:{attn.num_heads}, pruned_heads:{getattr(attn, 'pruned_heads', None)}")
-#'''
+'''
 
 # LibriSpeech ASR 데이터셋 로드 (train-clean-100 및 validation-clean)
 raw_train_dataset = load_dataset("Sreyan88/librispeech_asr", "clean", split="train.100")

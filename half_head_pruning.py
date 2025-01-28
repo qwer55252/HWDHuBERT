@@ -1,24 +1,34 @@
 import torch
-import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Wav2Vec2Config, Wav2Vec2Processor, TrainingArguments, Trainer, Wav2Vec2ForCTC
-from transformers.pytorch_utils import prune_linear_layer
+from transformers import Wav2Vec2Model, Wav2Vec2Config, Wav2Vec2Processor, HubertConfig, HubertForCTC, AutoProcessor
+import numpy as np
 
 from sklearn.cluster import SpectralClustering
 from sklearn.metrics import silhouette_score
+from scipy.stats import pearsonr
 
+import numpy as np
+from scipy.special import softmax
 from scipy.spatial.distance import cosine
 from scipy.stats import pearsonr
 
-from datasets import load_dataset
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datasets import load_dataset, Audio
+
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
+from transformers import TrainingArguments, Trainer, Wav2Vec2ForCTC
 from evaluate import load
 
 # =============== #
-# Token-based distance 함수들
+# 1. 모델 로드 예시
 # =============== #
+# 요청에 따라 Wav2Vec2 모델과 프로세서를 예시로 로드합니다.
+# (실제로는 BERT에서 attention을 추출해야 하므로, BERT 모델을 사용해야 함)
+from transformers import Wav2Vec2Processor, Wav2Vec2Model
+
 def cosine_distance(vec1, vec2):
     """1 - cosine similarity"""
     # scipy의 cosine()는 distance를 바로 반환하므로 그대로 사용해도 됨
@@ -91,7 +101,7 @@ def get_token_based_distance(matA, matB, metric="cosine"):
 
 
 # =============== #
-# Sentence-based distance 함수들
+# 4. Sentence-based distance 함수들
 # =============== #
 def distance_correlation(A, B):
     """
@@ -153,6 +163,8 @@ def get_sentence_based_distance(matA, matB, metric="dCor"):
     else:
         raise ValueError("Unknown sentence-based metric")
 
+
+
 def compute_pairwise_distances(attention_mats, distance_func, mode="token", metric="cosine"):
     """
     실제 Pairwise Distance 계산 예시
@@ -177,12 +189,16 @@ def compute_pairwise_distances(attention_mats, distance_func, mode="token", metr
     return dist_matrix
 
 
+
+# 예: 샘플 레이트 16k, 1초짜리 랜덤 파형 1개(batch_size=1)
 # TODO: 데이터 수 늘려야함 + 전체적인 하이퍼파라미터 수정 필요
+
 sample_rate = 16000
 duration = 1 # seconds
-batch_size = 10
+batch_size = 1
 audio_tensor = torch.randn(batch_size, sample_rate * duration) # (B, T)
-output_dir="Baseline"
+audio_tensor.shape
+
 
 # Wav2Vec2 모델 및 프로세서 로드
 model_name = "facebook/wav2vec2-base-100h"
@@ -195,10 +211,33 @@ model = Wav2Vec2ForCTC.from_pretrained(
     pad_token_id=processor.tokenizer.pad_token_id,
 )
 
-print(f'config: {config}')
 
-# TODO: 주석 remove
-#'''
+'''
+# HuBERT 모델 및 프로세서 로드
+model_name = "facebook/hubert-large-ls960-ft"
+config = HubertConfig.from_pretrained(model_name, output_attentions=True)
+processor = AutoProcessor.from_pretrained(model_name, config=config)
+model = HubertForCTC.from_pretrained(
+    model_name, 
+    output_attentions=True,
+    ctc_loss_reduction="mean", 
+    pad_token_id=processor.tokenizer.pad_token_id,
+)
+'''
+
+
+
+print(f'config: {config}')
+# TODO: Remove
+# config.feat_extract_norm == "layer"
+# print(f'config.num_feat_extract_layers: {config.num_feat_extract_layers}')
+# config.num_feat_extract_layers += 1
+# config.conv_dim = (512, 512, 512, 512, 512, 512, 512, 512)
+# config.conv_stride = (10,2,2,2,2,2,2)
+# config.conv_kernel=(10, 3, 3, 3, 3, 2, 2, 2)
+# model = Wav2Vec2Model.from_pretrained(model_name, config=config)
+
+
 # forward 시, attention을 함께 받아오기
 with torch.no_grad():
     outputs = model(audio_tensor, output_attentions=True)
@@ -209,19 +248,15 @@ num_layers = len(attentions)                    # 12
 num_heads_per_layer = attentions[0].shape[1]    # 12
 total_heads = num_layers * num_heads_per_layer  # 144
 
-if batch_size == 1:
-    # batch_size=1이므로 dim=0 없애기
-    attention_matrices = torch.stack(attentions).squeeze(1) # torch.Size([12, 12, 104, 104])
-else:
-    # batch_size=10이면, dim=1을 평균내어, torch.Size([12, 12, 104, 104]) 로 만듦
-    attention_matrices = torch.stack(attentions).mean(dim=1) # torch.Size([12, 12, 104, 104])
+# batch_size=1이므로 dim=0 없애기
+attention_matrices = torch.stack(attentions).squeeze(1) # torch.Size([12, 12, 104, 104])
 
 # (num_heads * num_layers, seq_len, seq_len)으로 변환
 seq_len = attention_matrices.shape[-1]
 attention_matrices = attention_matrices.view(-1, seq_len, seq_len) # torch.Size([144, 104, 104])
                             
                             
-
+'''
 head_distance_matrix = compute_pairwise_distances(
     attention_matrices,
     distance_func=get_token_based_distance,
@@ -230,15 +265,14 @@ head_distance_matrix = compute_pairwise_distances(
 )
 
 # TODO: head_distance_matirx를 0~1로 정규화 할 필요 있음 ✅
-print(f'min: {head_distance_matrix.min()}, max: {head_distance_matrix.max()}') # 0~2 사이인지 확인
 head_distance_matrix = head_distance_matrix / 2.0 # head_distance_matrix를 0~1 범위로 정규화 (2로 나누기)
-head_similarity_matrix = 1.0 - head_distance_matrix # TODO: 단순히 1에서 거리 뺀게 유사도라는거 수정해야함
+head_similarity_matrix = 1.0 - head_distance_matrix 
 
 
 # 스펙트럴 클러스터링을 위해 precomputed affinity 사용을 가정
 # SKlearn의 SpectralClustering을 사용하여 스펙트럴 클러스터링을 수행 -> 여기서는 유사도 행렬을 사용해야만 함
 
-pruning_ratio = 0.2
+pruning_ratio = 0.4
 # 원하는 클러스터 개수 (pruning_ratio 파라미터에 따라 결정되게 수정 필요)
 n_clusters = int(total_heads * pruning_ratio)
 clustering = SpectralClustering(n_clusters=n_clusters, affinity='precomputed', assign_labels='kmeans', random_state=42)
@@ -266,19 +300,11 @@ except Exception as e:
 # 예: 클러스터마다 첫 번째로 만나는 Head를 대표로 선정 <- 일단 이렇게 구현하자
 
 cluster_to_rep = {} # cluster_id -> 대표 head_id
-cluster_head_dict = {} # cluster_head_dict[cluster_id] -> [head_id1, head_id2, ...]
-
-# TODO: 대표 head 선정 방법을 수정해야 함 -> 일단 클러스터별로 랜덤하게
+# TODO: 대표 head 선정 방법을 수정해야 함
 for head_idx, c_id in enumerate(cluster_labels):
-    cluster_head_dict[c_id] = cluster_head_dict.get(c_id, []) + [head_idx]
-
-    # if c_id not in cluster_to_rep:
-    #     cluster_to_rep[c_id] = head_idx
-for c_id, head_indices in cluster_head_dict.items():
-    # 랜덤하게 대표 head 선정
-    cluster_to_rep[c_id] = np.random.choice(head_indices)
+    if c_id not in cluster_to_rep:
+        cluster_to_rep[c_id] = head_idx
 # cluster_to_rep[c_id] = head_idx: c_id 클러스터의 대표 head는 head_idx번째 head
-print(f'cluster_to_rep: {cluster_to_rep}')
 
 # 각 클러스터 대표만 남긴다고 가정
 selected_head_indices = list(cluster_to_rep.values()) # values에는 대표 head index들이 들어있음
@@ -292,14 +318,11 @@ for c_id, rep_head_idx in cluster_to_rep.items():
     head_id_in_layer = rep_head_idx % num_heads_per_layer
     layer_to_keep[layer_id].append(head_id_in_layer)
 # layer_to_keep[layer_id] = [...] -> 해당 layer에서 남길 head들의 index들
-for layer_idx in range(num_layers):
-    if not layer_to_keep[layer_idx]:
-        layer_to_keep[layer_idx] = [0] # 해당 레이어에 대표 head가 없으면 첫 번째 Head 살림 # TODO: 수정 필요
-print(f'layer_to_keep: {layer_to_keep}')
+layer_to_keep
 
 
 
-# 클러스터링 결과로부터 layer_to_keep(유지할 head) -> heads_to_prune(제거할 head) 변환
+
 def build_prune_dict(model_config, layer_to_keep_dict):
     """
     layer_to_keep_dict: 예) {0: [0, 2], 1: [1, 3, 5], ...}
@@ -313,9 +336,6 @@ def build_prune_dict(model_config, layer_to_keep_dict):
     
     for layer_idx in range(model_config.num_hidden_layers):
         keep_heads = set(layer_to_keep_dict.get(layer_idx, []))
-        # 만약 해당 레이어에 유지할 헤드가 없다면, 기본값으로 0번 헤드를 유지
-        if not keep_heads:
-            keep_heads = {0}
         all_heads = set(range(num_attention_heads))
         # prune할 head는 all_heads - keep_heads
         prune_heads = sorted(list(all_heads - keep_heads))
@@ -325,6 +345,9 @@ def build_prune_dict(model_config, layer_to_keep_dict):
     return heads_to_prune
 
 heads_to_prune = build_prune_dict(model.config, layer_to_keep)
+
+'''         
+from transformers.pytorch_utils import prune_linear_layer
 
 def find_pruneable_heads_and_indices(heads, num_heads, head_size, already_pruned_heads=None):
     """
@@ -407,16 +430,39 @@ def prune_wav2vec2_attention(model, heads_to_prune_dict):
         # layer_module.attention: Wav2Vec2Attention
         prune_wav2vec2_attention_layer(layer_module.attention, prune_head_list)
 
- # Baseline 성능 뽑기 위해 일단 주석 처리 
-# heads_to_prune = {0: [1,3,5,7,9,11], 1: [0,2,4,6,8,10], 2: [1,3,5,7,9,11], 3: [0,2,4,6,8,10], 4: [1,3,5,7,9,11], 5: [0,2,4,6,8,10], 6: [1,3,5,7,9,11], 7: [0,2,4,6,8,10], 8: [1,3,5,7,9,11], 9: [0,2,4,6,8,10], 10: [1,3,5,7,9,11], 11: [0,2,4,6,8,10]}
+###
+# 클러스터링 결과로부터 layer_to_keep(유지할 head) -> heads_to_prune(제거할 head) 변환
+###
+
+def build_heads_to_prune_dict(config, layer_to_keep_dict):
+    """
+    layer_to_keep_dict: 예) {0: [0, 2], 1: [1, 3, 5], ...}
+    config: Wav2Vec2Config
+    return: heads_to_prune 형태의 dict
+       예) { layer_i: [head_i, head_j, ...], ... }
+    """
+    num_attention_heads = config.num_attention_heads  # (예: 12)
+    num_hidden_layers = config.num_hidden_layers      # (예: 12)
+    heads_to_prune = {}
+    
+    for layer_idx in range(num_hidden_layers):
+        keep_heads = set(layer_to_keep_dict.get(layer_idx, []))
+        all_heads = set(range(num_attention_heads))
+        # 제거해야 할 head = 전체 - 유지
+        prune_heads = sorted(list(all_heads - keep_heads))
+        if prune_heads:
+            heads_to_prune[layer_idx] = prune_heads
+    return heads_to_prune
+
+heads_to_prune = {0: [1,3,5,7,9,11], 1: [0,2,4,6,8,10], 2: [1,3,5,7,9,11], 3: [0,2,4,6,8,10], 4: [1,3,5,7,9,11], 5: [0,2,4,6,8,10], 6: [1,3,5,7,9,11], 7: [0,2,4,6,8,10], 8: [1,3,5,7,9,11], 9: [0,2,4,6,8,10], 10: [1,3,5,7,9,11], 11: [0,2,4,6,8,10]}
 ### 3) 커스텀 Pruning 함수 호출
 prune_wav2vec2_attention(model, heads_to_prune)
 
 # 잘 되었는지 확인(레이어별 num_heads, pruned_heads 상태)
 for i, layer in enumerate(model.wav2vec2.encoder.layers):
+# for i, layer in enumerate(model.hubert.encoder.layers):
     attn = layer.attention
     print(f"Layer {i} -> num_heads:{attn.num_heads}, pruned_heads:{getattr(attn, 'pruned_heads', None)}")
-#'''
 
 # LibriSpeech ASR 데이터셋 로드 (train-clean-100 및 validation-clean)
 raw_train_dataset = load_dataset("Sreyan88/librispeech_asr", "clean", split="train.100")
@@ -464,6 +510,8 @@ def preprocess_function(batch):
     # batch["labels"] = labels["input_ids"]
     return batch
     
+# train_dataset = raw_train_dataset.map(preprocess_function, remove_columns=raw_train_dataset.column_names)
+# eval_dataset = raw_eval_dataset.map(preprocess_function, remove_columns=raw_eval_dataset.column_names)
 print(f'raw_train_dataset.column_names : {raw_train_dataset.column_names}')
 train_dataset = raw_train_dataset.map(preprocess_function, batched=True)
 eval_dataset = raw_eval_dataset.map(preprocess_function, batched=True)
@@ -472,6 +520,74 @@ eval_dataset = raw_eval_dataset.map(preprocess_function, batched=True)
 print(train_dataset)
 print(eval_dataset)
 
+
+'''
+def padded_gather_function(tensors, padding_index=-100, dim=1):
+    """
+    주어진 차원(dim)을 기준으로 텐서들을 패딩한 후 cat.
+    - tensors: 여러 텐서가 들어있는 리스트 or 튜플 or 단일 Tensor
+    """
+    # 1) 만약 단일 Tensor라면, 리스트로 감싸기
+    if isinstance(tensors, torch.Tensor):
+        tensors = [tensors]
+    # 2) 튜플이면 리스트로 변환
+    elif isinstance(tensors, tuple):
+        tensors = list(tensors)
+
+    # 3) 만약 길이가 1이고, 그 안에 또 (list or tuple) 로 텐서들이 들어 있다면 풀어주기
+    #    예: tensors = [(tensorA, tensorB, ...)] -> tensors = [tensorA, tensorB, ...]
+    if len(tensors) == 1 and isinstance(tensors[0], (tuple, list)):
+        tensors = tensors[0]
+
+    # -- 여기까지 오면, 최소한 `tensors`는 "리스트(또는 튜플) of Tensor" 형태라고 가정 --
+    # (단, 여전히 단일 텐서만 들어있을 수도 있지만, 그 경우 [that_tensor] 상태로 wrap돼 있음)
+
+    # 4) 패딩이 필요한지 확인.
+    #    만약 dim 차원을 갖는 텐서들만 골라서 pad하려면 아래 로직을 사용.
+    valid_tensors = [t for t in tensors if t.dim() > dim]
+
+    # 5) 유효 텐서가 없다면, 그냥 전체를 cat 시도 (이 때도 tensors는 list of Tensor)
+    if not valid_tensors:
+        # 예: [tensor1] 하나만 있을 수도, 여러 텐서일 수도 있음
+        # torch.cat(...)가 가능한 형태인지 확인해야 함
+        if len(tensors) == 1:
+            # 한 개만 있으면 굳이 cat할 필요 없이 그대로 반환
+            return tensors[0]
+        else:
+            # 여러 개가 있다면, 차원이 맞는지(모두 dim=0 이상) 확인 후 cat
+            return torch.cat(tensors, dim=0)
+
+    # 6) 실제로 패딩 작업 수행
+    max_size = max(t.shape[dim] for t in valid_tensors)
+    padded_tensors = []
+    for t in tensors:
+        # t.dim() <= dim 인 경우에는 pad가 불가능할 수 있으니,
+        # 그냥 그대로 append할 수도 있고, 혹은 스킵해야 할 수도 있음(필요에 맞게 결정)
+        if t.dim() > dim:
+            pad_size = max_size - t.shape[dim]
+            if pad_size > 0:
+                pad_dims = [0, 0] * (t.dim() - dim - 1) + [0, pad_size]
+                t = F.pad(t, pad_dims, value=padding_index)
+        padded_tensors.append(t)
+
+    # 7) 패딩된 텐서들을 cat
+    return torch.cat(padded_tensors, dim=0)
+    
+
+class CustomTrainer(Trainer):
+    def evaluation_loop(
+        self,
+        dataloader,
+        description,
+        prediction_loss_only=None,
+        ignore_keys=None,
+        metric_key_prefix="eval",
+    ):
+        # 평가 루프 시작 전에 gather_function을 커스텀 함수로 재정의
+        self.gather_function = lambda tensors: padded_gather_function(tensors, padding_index=-100, dim=1)
+        # 부모 클래스의 evaluation_loop 호출하여 나머지 로직 수행
+        return super().evaluation_loop(dataloader, description, prediction_loss_only, ignore_keys, metric_key_prefix)
+'''
 
 @dataclass
 class DataCollatorCTCWithPadding:
@@ -546,7 +662,7 @@ def compute_metrics(pred):
     return {"wer": wer}
 
 training_args = TrainingArguments(
-    output_dir=output_dir,
+    output_dir="./test-ft",
     num_train_epochs=50,
     per_device_train_batch_size=4,
     evaluation_strategy="epoch",
