@@ -367,8 +367,8 @@ def compute_metrics(pred):
     label_str = processor.batch_decode(label_ids, group_tokens=False)
 
     wer = wer_metric.compute(predictions=pred_str, references=label_str)
-    print(f'pred_str: {pred_str}')
-    print(f'label_str: {label_str}')
+    # print(f'pred_str: {pred_str}')
+    # print(f'label_str: {label_str}')
     return {"wer": wer}
 
 def my_compute_loss_ctc(outputs, labels, processor=None, blank_token_id=None, num_items_in_batch=None):
@@ -501,39 +501,74 @@ def get_avg_attention_matrices(model, processor, dataset, sample_size=10, alread
     # avg_attn = attn_stack.mean(dim=1)              # (num_layers, num_heads, seq_len, seq_len)
     # return avg_attn.cpu()
 
-def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5, current_num_heads=None, already_pruned_heads=None):
+def delete_pruned_heads_from_similarity_matrix(similarity_matrix, already_pruned_heads, init_num_heads=12):
+    '''
+        similarity_matrix:
+            (init_num_heads, init_num_heads) shape의 matrix
+        
+        Return:
+            (init_num_heads, init_num_heads) shape의 matrix 에서 pruned된 head의 gloval_index 행, 렬 제거
+    '''
+    
+    # pruned된 head의 global index list
+    pruned_heads_list = list(layer_idx * init_num_heads + head_idx 
+                            for layer_idx, pruned_heads in already_pruned_heads.items() 
+                            for head_idx in pruned_heads)
+    
+    # pruned된 head의 global index list를 제외한 similarity_matrix
+    deleted_similarity_matrix = np.delete(similarity_matrix, pruned_heads_list, axis=0)
+    deleted_similarity_matrix = np.delete(deleted_similarity_matrix, pruned_heads_list, axis=1)
+    
+    return deleted_similarity_matrix
+    
+def restore_pruned_heads_to_cluster_labels(cluster_labels, already_pruned_heads, init_num_heads):
+    '''
+        cluster_labels:
+            (current_num_heads,) shape의 cluster label list
+        
+        Return:
+            pruned된 head의 cluster label을 -1로 변경한 cluster label list
+    '''
+    # pruned된 head의 global index list
+    pruned_heads_list = list(layer_idx * init_num_heads + head_idx 
+                            for layer_idx, pruned_heads in already_pruned_heads.items() 
+                            for head_idx in pruned_heads)
+    
+    for pruned_head_g_idx in sorted(pruned_heads_list):
+        cluster_labels = np.insert(cluster_labels, pruned_head_g_idx, -1)
+    
+    return cluster_labels
+
+def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5, init_num_total_heads=144, already_pruned_heads=None, is_test=False, init_num_heads=12):
     """
     attn_matrices: shape = (num_layers, num_heads, seq_len, seq_len)
     distance_metric: "corr", "cosine", ...
     n_remove: 이번 단계에서 제거할 head 개수 (전체를 통틀어)
     반환: 제거해야 할 head들의 (layer_idx, head_idx) 리스트
     """
-    total_heads_current = current_num_heads
+    print(f'--------- START cluster_and_select_heads FUNCTION ---------')
+    # init_num_total_heads = current_num_heads
+    current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
     seq_len = attn_matrices.size(-1)
-    print(f'')
 
     # (num_layers*num_heads, seq_len, seq_len)로 reshape
-    reshaped_attn = attn_matrices.view(-1, seq_len, seq_len)  # shape: (total_heads_current, seq_len, seq_len)
+    reshaped_attn = attn_matrices.view(-1, seq_len, seq_len)  # shape: (init_num_total_heads, seq_len, seq_len)
     # reshaped_attn 자체가 padding을 거쳐서 나와서 index 정보 훼손됨
 
     # 1) 헤드 간 distance matrix 계산
     print(f" - Calculating pairwise distances ...")
-    distance_matrix = compute_pairwise_distances(
+    if not is_test:
+        distance_matrix = compute_pairwise_distances(
             reshaped_attn,
             distance_func=get_token_based_distance,
             mode="token",
             metric=distance_metric
         )
-    # if not is_test:
-    #     distance_matrix = compute_pairwise_distances(
-    #         reshaped_attn,
-    #         distance_func=get_token_based_distance,
-    #         mode="token",
-    #         metric=distance_metric
-    #     )
-    # else:
-    #     # 테스트용: 0~2 범위의 랜덤 distance matrix 생성
-    #     distance_matrix = np.random.rand(total_heads_current, total_heads_current) * 2.0
+    else:
+        # 테스트용: 0~2 범위의 랜덤 distance matrix 생성
+        distance_matrix = np.random.rand(init_num_total_heads, init_num_total_heads) * 2.0
+    
+    
     print(f" - Distance matrix shape: {distance_matrix.shape}")
     # 2) 0~1 범위로 간단 정규화(예: 0~2 구간이라고 가정 후 /2)
     distance_matrix = distance_matrix / 2.0
@@ -543,18 +578,23 @@ def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5
     # 4) 스펙트럴 클러스터링
     #    이번에 제거할 head 개수가 n_remove -> 남길 head 개수 = total_heads_current - n_remove
     #    => 클러스터 수 = 남길 head 개수(각 클러스터에서 대표 head 1개)
-    n_clusters = max(1, total_heads_current - n_remove)  # 최소 1
+    n_clusters = max(1, current_num_heads - n_remove)  # 최소 1
     clustering = SpectralClustering(n_clusters=n_clusters, affinity='precomputed', assign_labels='kmeans', random_state=42)
-    cluster_labels = clustering.fit_predict(similarity_matrix)
-    # TODO: 이미 pruned 된 similairy_matrix를 사용하면, cluster_labels가 이상하게 나올 수 있음
-    # already_pruned_head를 참고해서 similarity_matrix에서 index i가 실제로 몇번째 layer의 몇번째 head인지 알아내야 함
+    
+    # similarity_matrix 에서 이미 pruned 된 head의 행과 열 제거
+    deleted_similarity_matrix = delete_pruned_heads_from_similarity_matrix(similarity_matrix, already_pruned_heads)
+    print(f'similarity_matrix.shape: {similarity_matrix.shape}')
+    print(f'already_pruned_heads: {already_pruned_heads}')
+    
+    cluster_labels = clustering.fit_predict(deleted_similarity_matrix)
+    print(f'Pruned cluster_labels: {cluster_labels}')
+    
+    
+    cluster_labels = restore_pruned_heads_to_cluster_labels(cluster_labels, already_pruned_heads, init_num_heads)
+    print(f'After Restore cluster_labels: {cluster_labels}')
 
     
     # # cluster_labels에 이미 prunede된 head는 -1로 표시
-    # for i in range(total_heads_current):
-
-    
-    print(f'cluster_labels: {cluster_labels}')
 
     # 혹시 silhouette_score를 확인해볼 수 있음(거리 행렬 사용)
     try:
@@ -568,20 +608,28 @@ def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5
     cluster_head_dict = {}
 
     for head_idx, c_id in enumerate(cluster_labels):
-        if c_id == -1:
-            continue
+        # pruning된 head는 class_label -1로 표시해뒀음
         cluster_head_dict[c_id] = cluster_head_dict.get(c_id, []) + [head_idx]
     print(f'cluster_head_dict: {cluster_head_dict}')
 
     for c_id, head_indices in cluster_head_dict.items():
+        if c_id == -1:
+            continue
         rep_head_idx = np.random.choice(head_indices)  # 랜덤 대표
         cluster_to_rep[c_id] = rep_head_idx
     print(f'cluster_to_rep: {cluster_to_rep}')
 
     # 6) 전체 head 중, 대표로 선택된 head만 keep. 나머지는 prune
     keep_set = set(cluster_to_rep.values())
-    all_heads_set = set(range(total_heads_current))
-    prune_set = all_heads_set - keep_set  # 이번 단계에서 제거할 head의 global index
+    all_heads_set = set(range(init_num_total_heads))
+    # pruning 할 head set = 전체 head - 이미 pruning된 head - keep_set
+    # already_pruned_heads_set = set([layer_idx * 12 + head_idx for layer_idx, head_idx in already_pruned_heads.items()]) # TODO: 12 -> config에서 뽑도록 수정
+    
+    already_pruned_heads_set = set([layer_idx * init_num_heads + head_idx 
+                                    for layer_idx, pruned_heads in already_pruned_heads.items() 
+                                    for head_idx in pruned_heads])
+    prune_set = all_heads_set - already_pruned_heads_set - keep_set  # 이번 단계에서 제거할 head의 global index
+    # prune_set = all_heads_set - keep_set  # 이번 단계에서 제거할 head의 global index
 
     # (layer_idx, head_idx)로 변환
     remove_list = []
@@ -589,12 +637,12 @@ def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5
     # TODO: 이거 layer마다 head 개수가 다른데 이렇게 하면 안돼
     
     
-    
     for g_idx in prune_set:
         layer_idx = g_idx // num_heads
         head_idx_in_layer = g_idx % num_heads
         remove_list.append((layer_idx, head_idx_in_layer))
     print(f" - Heads to remove: {remove_list}")
+    print(f'--------- END cluster_and_select_heads FUNCTION ---------')
     return remove_list
 
 
@@ -608,7 +656,7 @@ duration = 1 # seconds
 batch_size = 10
 audio_tensor = torch.randn(batch_size, sample_rate * duration) # (B, T)
 output_dir="IHP_implementation"
-is_test = False
+is_test = True
 total_pruning_iterations = 10
 pruning_ratio = 0.2  # 최종적으로 전체 헤드의 20%만 남기고 싶다고 가정
 iterative_finetune_epochs = 2 # total fine-tuning epochs: 2*10 epochs
@@ -686,9 +734,9 @@ trainer_1 = Custom_Trainer(
 # 1) 초기 설정
 init_num_layers = model.config.num_hidden_layers
 init_num_heads = model.config.num_attention_heads
-initial_total_heads = init_num_layers * init_num_heads
+init_num_total_heads = init_num_layers * init_num_heads
 # (전체 헤드 중 (1 - pruning_ratio)만큼을 10회에 걸쳐 제거)
-heads_to_remove_per_step = int( initial_total_heads * (1 - pruning_ratio) / total_pruning_iterations )
+heads_to_remove_per_step = int( init_num_total_heads * (1 - pruning_ratio) / total_pruning_iterations )
 print(f"[초기설정] iteration x {total_pruning_iterations}, 최종 pruning_ratio={pruning_ratio}")
 print(f"한 번에 제거할 head 수: {heads_to_remove_per_step}")
 
@@ -701,6 +749,15 @@ already_pruned_heads_dict = {layer_idx: set() for layer_idx in range(init_num_la
 current_model = model
 current_model.config.output_attentions = True  # attention 추출 허용
 
+def find_remaining_heads(already_pruned_heads_dict, init_num_total_heads): # 현재 남은 전체 헤드 수 계산
+    pruned_heads_num = 0
+    for layer_idx, pruned_heads in already_pruned_heads_dict.items():
+        pruned_heads_num += len(pruned_heads)
+    
+    
+    remaining_heads_num = init_num_total_heads - pruned_heads_num
+    return remaining_heads_num
+
 for iteration in range(total_pruning_iterations):
     print(f"\n[Iteration {iteration+1}/{total_pruning_iterations}]")
 
@@ -710,11 +767,8 @@ for iteration in range(total_pruning_iterations):
     )
     # avg_attn_matrices: Tensor(init_num_layers, init_num_heads, seq_len, seq_len)
 
-    # 현재 남아있는 총 head 수
-    current_num_heads = 0
-    for layer_idx in range(init_num_layers):
-        # 레이어별로 실제 남은 head 수 = model.wav2vec2.encoder.layers[layer_idx].attention.num_heads
-        current_num_heads += current_model.wav2vec2.encoder.layers[layer_idx].attention.num_heads
+    # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
+    current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
     print(f" - 현재 남아있는 전체 헤드 수: {current_num_heads}")
 
     # 이번 단계에서 제거할 head 수 계산(절대 개수)
@@ -724,7 +778,7 @@ for iteration in range(total_pruning_iterations):
         n_remove = current_num_heads - 1  # 최소 1개는 남김
 
     # 4) 클러스터링 -> 제거 대상 head 선정
-    remove_candidates = cluster_and_select_heads(avg_attn_matrices, distance_metric=distance_metric, n_remove=n_remove, current_num_heads=current_num_heads, already_pruned_heads=already_pruned_heads_dict)
+    remove_candidates = cluster_and_select_heads(avg_attn_matrices, distance_metric=distance_metric, n_remove=n_remove, init_num_total_heads=init_num_total_heads, already_pruned_heads=already_pruned_heads_dict, is_test=is_test, init_num_heads=init_num_heads)
     # remove_candidates: [(layer_idx, head_idx_in_layer), ...]
     print(f''' - 제거할 head 후보: {remove_candidates}''')
 
@@ -734,6 +788,11 @@ for iteration in range(total_pruning_iterations):
     for (lyr_idx, h_idx) in remove_candidates:
         # 이미 제거된 head면 skip
         if h_idx in already_pruned_heads_dict[lyr_idx]:
+            print(f' - 이미 제거된 head 이니 건너뜀: ({lyr_idx}, {h_idx})')
+            continue
+        # 이 head까지 pruning하면 해당 layer에 더이상 남는 head가 없다면 skip
+        if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+            print(f' - 이 head까지 제거하면 더이상 남는 head가 없어서 건너뜀: ({lyr_idx}, {h_idx})')
             continue
         layer_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
     print(f" - Heads to prune: {layer_to_prune_dict}")
