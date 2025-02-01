@@ -1,5 +1,6 @@
 import torch
 import random
+import argparse
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
@@ -355,21 +356,6 @@ def prune_wav2vec2_attention(model, heads_to_prune_dict):
 def preprocess_function(batch):
     return batch
 
-def compute_metrics(pred):
-    pred_logits = pred.predictions
-    pred_ids = np.argmax(pred_logits, axis=-1)
-    # processor.decode를 이용해 토큰 id를 텍스트로 변환
-    pred_str = processor.batch_decode(pred_ids)
-    # 라벨도 문자열로 변환
-    label_ids = pred.label_ids
-    # 패딩(-100) 제거 및 문자열 변환
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-    label_str = processor.batch_decode(label_ids, group_tokens=False)
-
-    wer = wer_metric.compute(predictions=pred_str, references=label_str)
-    # print(f'pred_str: {pred_str}')
-    # print(f'label_str: {label_str}')
-    return {"wer": wer}
 
 def my_compute_loss_ctc(outputs, labels, processor=None, blank_token_id=None, num_items_in_batch=None):
     """
@@ -456,7 +442,7 @@ def pad_attention_tensors_to_max(avg_attn_per_layer, model_config, already_prune
     padded_tensors = torch.stack(padded_layer_tensors, dim=0)  # [init_num_layer, init_num_head, seq_len, seq_len]
     return padded_tensors
 
-def get_avg_attention_matrices(model, processor, dataset, sample_size=10, already_pruned_heads=None): # TODO: sample_size config에서 수정하도록
+def get_avg_attention_matrices(model, processor, dataset, data_collator, sample_size=10, already_pruned_heads=None): # TODO: sample_size config에서 수정하도록
     """
     랜덤하게 sample_size개를 뽑아, 모델 forward(attention) -> 평균 attention matrix 획득
     반환 shape: (num_layers, num_heads, seq_len, seq_len)
@@ -539,7 +525,7 @@ def restore_pruned_heads_to_cluster_labels(cluster_labels, already_pruned_heads,
     
     return cluster_labels
 
-def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5, init_num_total_heads=144, already_pruned_heads=None, is_test=False, init_num_heads=12):
+def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5, init_num_total_heads=144, already_pruned_heads=None, test_mode=False, init_num_heads=12):
     """
     attn_matrices: shape = (num_layers, num_heads, seq_len, seq_len)
     distance_metric: "corr", "cosine", ...
@@ -548,7 +534,7 @@ def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5
     """
     print(f'--------- START cluster_and_select_heads FUNCTION ---------')
     # init_num_total_heads = current_num_heads
-    current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
+    current_num_heads = find_remaining_heads(already_pruned_heads, init_num_total_heads)
     seq_len = attn_matrices.size(-1)
 
     # (num_layers*num_heads, seq_len, seq_len)로 reshape
@@ -557,7 +543,7 @@ def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5
 
     # 1) 헤드 간 distance matrix 계산
     print(f" - Calculating pairwise distances ...")
-    if not is_test:
+    if not test_mode:
         distance_matrix = compute_pairwise_distances(
             reshaped_attn,
             distance_func=get_token_based_distance,
@@ -645,239 +631,329 @@ def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5
     print(f'--------- END cluster_and_select_heads FUNCTION ---------')
     return remove_list
 
-
-
-# TODO: argparse 사용 + config 파일 사용하도록 수정 필요
-# TODO: 데이터 수 늘려야함 + 전체적인 하이퍼파라미터 수정 필요
-
-### Stage 1. 모델 및 데이터셋 설정
-sample_rate = 16000
-duration = 1 # seconds
-batch_size = 10
-audio_tensor = torch.randn(batch_size, sample_rate * duration) # (B, T)
-output_dir="IHP_implementation"
-is_test = True
-total_pruning_iterations = 10
-pruning_ratio = 0.2  # 최종적으로 전체 헤드의 20%만 남기고 싶다고 가정
-iterative_finetune_epochs = 2 # total fine-tuning epochs: 2*10 epochs
-final_finetune_epochs = 50
-per_device_train_batch_size = 4
-distance_metric = "cosine" # token -> "cosine", "corr", "js", "bc" 중 선택 / sentence -> "dCor", "PC", "CC" 중 선택
-
-# Wav2Vec2 모델 및 프로세서 로드
-model_name = "facebook/wav2vec2-base-100h"
-config = Wav2Vec2Config.from_pretrained(model_name, output_attentions=True)
-processor = Wav2Vec2Processor.from_pretrained(model_name, config=config)
-model = Wav2Vec2ForCTC.from_pretrained(
-    model_name, 
-    output_attentions=True,
-    ctc_loss_reduction="mean", 
-    pad_token_id=processor.tokenizer.pad_token_id,
-)
-
-print(f'config: {config}')
-
-
-### Stage 2. 데이터셋 준비
-# LibriSpeech ASR 데이터셋 로드 (train-clean-100 및 validation-clean)
-raw_train_dataset = load_dataset("Sreyan88/librispeech_asr", "clean", split="train.100")
-raw_eval_dataset = load_dataset("Sreyan88/librispeech_asr", "clean", split="validation") # TODO: 비교를 위해서 validation 쓰고 있는데, test로 바꿔야함
-
-chars_to_ignore_regex = r"[\,\?\.\!\-\;\:\"\“\%\‘\”\‘]"
-
-print(f'raw_train_dataset.column_names : {raw_train_dataset.column_names}')
-# train_dataset = raw_train_dataset.map(preprocess_function, batched=True)
-# eval_dataset = raw_eval_dataset.map(preprocess_function, batched=True)
-train_dataset = raw_train_dataset.map(preprocess_function, num_proc=4)
-eval_dataset = raw_eval_dataset.map(preprocess_function, num_proc=4)
-if is_test: # 100개 데이터만 사용
-    train_dataset = train_dataset.select(range(100))
-    eval_dataset = eval_dataset.select(range(100))
-print(train_dataset)
-print(eval_dataset)
-
-data_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
-
-### Stage 3. Iterative Head Pruning 수행
-model.config.output_attentions = False # Pruning 후에는 attention 출력 끔
-wer_metric = load("wer")
-training_args_1 = TrainingArguments(
-    output_dir=output_dir,
-    num_train_epochs=iterative_finetune_epochs,
-    per_device_train_batch_size=per_device_train_batch_size,
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    logging_steps=10,
-    learning_rate=1e-4,
-    fp16=True,  # GPU 사용 시
-    save_total_limit=1,
-    load_best_model_at_end=True,
-    metric_for_best_model="wer",
-    greater_is_better=False,
-    push_to_hub=False,
-    remove_unused_columns=False,
-)
-
-
-trainer_1 = Custom_Trainer(
-    model=model,
-    args=training_args_1,
-    data_collator=data_collator,
-    train_dataset=train_dataset,  # 준비된 데이터셋
-    eval_dataset=eval_dataset,
-    processing_class=processor,
-    processor=processor,
-    compute_metrics=compute_metrics,
-    compute_loss_func=my_compute_loss_ctc,
-)
-
-# 1) 초기 설정
-init_num_layers = model.config.num_hidden_layers
-init_num_heads = model.config.num_attention_heads
-init_num_total_heads = init_num_layers * init_num_heads
-# (전체 헤드 중 (1 - pruning_ratio)만큼을 10회에 걸쳐 제거)
-heads_to_remove_per_step = int( init_num_total_heads * (1 - pruning_ratio) / total_pruning_iterations )
-print(f"[초기설정] iteration x {total_pruning_iterations}, 최종 pruning_ratio={pruning_ratio}")
-print(f"한 번에 제거할 head 수: {heads_to_remove_per_step}")
-
-# 각 단계별로 이미 제거된 heads를 추적하기 위해, layer 단위로 set 사용
-already_pruned_heads_dict = {layer_idx: set() for layer_idx in range(init_num_layers)}
-
-# ======================== #
-# 실제 Iterative Pruning 루프
-# ======================== #
-current_model = model
-current_model.config.output_attentions = True  # attention 추출 허용
-
 def find_remaining_heads(already_pruned_heads_dict, init_num_total_heads): # 현재 남은 전체 헤드 수 계산
     pruned_heads_num = 0
     for layer_idx, pruned_heads in already_pruned_heads_dict.items():
         pruned_heads_num += len(pruned_heads)
-    
-    
     remaining_heads_num = init_num_total_heads - pruned_heads_num
     return remaining_heads_num
 
-for iteration in range(total_pruning_iterations):
-    print(f"\n[Iteration {iteration+1}/{total_pruning_iterations}]")
-
-    # 3) 헤드 평가용 attention 추출 (랜덤 10샘플)
-    avg_attn_matrices = get_avg_attention_matrices(
-        current_model, processor, train_dataset, sample_size=10, already_pruned_heads=already_pruned_heads_dict
-    )
-    # avg_attn_matrices: Tensor(init_num_layers, init_num_heads, seq_len, seq_len)
-
-    # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
-    current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
-    print(f" - 현재 남아있는 전체 헤드 수: {current_num_heads}")
-
-    # 이번 단계에서 제거할 head 수 계산(절대 개수)
-    n_remove = heads_to_remove_per_step
-    # 만약 현재 남은 head 수가 n_remove보다 작으면, 조정
-    if current_num_heads <= n_remove:
-        n_remove = current_num_heads - 1  # 최소 1개는 남김
-
-    # 4) 클러스터링 -> 제거 대상 head 선정
-    remove_candidates = cluster_and_select_heads(avg_attn_matrices, distance_metric=distance_metric, n_remove=n_remove, init_num_total_heads=init_num_total_heads, already_pruned_heads=already_pruned_heads_dict, is_test=is_test, init_num_heads=init_num_heads)
-    # remove_candidates: [(layer_idx, head_idx_in_layer), ...]
-    print(f''' - 제거할 head 후보: {remove_candidates}''')
-
-    # heads_to_prune_dict에 반영
-    # 이미 제거된 head는 빼고, 새롭게 제거될 head만 추가
-    layer_to_prune_dict = {} # ex) {0: [1,3,5,7,9,11], 1: [0,2,4,6,8,10], ...}
-    for (lyr_idx, h_idx) in remove_candidates:
-        # 이미 제거된 head면 skip
-        if h_idx in already_pruned_heads_dict[lyr_idx]:
-            print(f' - 이미 제거된 head 이니 건너뜀: ({lyr_idx}, {h_idx})')
-            continue
-        # 이 head까지 pruning하면 해당 layer에 더이상 남는 head가 없다면 skip
-        if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
-            print(f' - 이 head까지 제거하면 더이상 남는 head가 없어서 건너뜀: ({lyr_idx}, {h_idx})')
-            continue
-        layer_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
-    print(f" - Heads to prune: {layer_to_prune_dict}")
-    # 실제 prune 실행 (5) 헤드 프루닝
-    prune_wav2vec2_attention(current_model, layer_to_prune_dict)
-
-    # already_pruned_heads_dict 갱신
-    for lyr_idx, h_idxs in layer_to_prune_dict.items():
-        for h_idx in h_idxs:
-            already_pruned_heads_dict[lyr_idx].add(h_idx)
-    print(f' - 현재까지 제거된 head: {already_pruned_heads_dict}')
-    print(f" - Iteration {iteration+1} 프루닝 완료")
     
-    # 5) 프루닝 후 미세조정(Fine-tuning)
-    #    - 여기서는 시간 절약을 위해 적은 epoch로 실행
+def find_heads_to_keep(attn_matrices, already_pruned_heads_dict, init_num_total_heads, args):  # 제거하지 말아야 할 Head 찾아서, already_pruned_heads_dict에 추가
+    seq_len = attn_matrices.size(-1)
+
+    # (num_layers*num_heads, seq_len, seq_len)로 reshape
+    reshaped_attn = attn_matrices.view(-1, seq_len, seq_len)  # shape: (init_num_total_heads, seq_len, seq_len)
+    # reshaped_attn 자체가 padding을 거쳐서 나와서 index 정보 훼손됨
+
+    # 1) 헤드 간 distance matrix 계산
+    print(f" - Calculating pairwise distances ...")
+    if not args.test_mode:
+        distance_matrix = compute_pairwise_distances(
+            reshaped_attn,
+            distance_func=get_token_based_distance,
+            mode="token",
+            metric=args.distance_metric
+        )
+    else:
+        # 테스트용: 0~2 범위의 랜덤 distance matrix 생성
+        distance_matrix = np.random.rand(init_num_total_heads, init_num_total_heads) * 2.0
+    
+    print(f" - Distance matrix shape: {distance_matrix.shape}")
+    # 2) 0~1 범위로 간단 정규화(예: 0~2 구간이라고 가정 후 /2)
+    distance_matrix = distance_matrix / 2.0
+    # 3) 유사도 행렬 = 1 - distance
+    similarity_matrix = 1.0 - distance_matrix
+    
+    # 4) similarity_matrix를 기준으로 유사도가 가장 적은 head 10개 추출
+    #    (pruning하지 않을 head들)
+    heads_to_keep = []
+    for head_idx in range(init_num_total_heads):
+        # head_idx에 대한 similarity_matrix의 평균 유사도
+        avg_similarity = similarity_matrix[head_idx].mean()
+        heads_to_keep.append((head_idx, avg_similarity))
+    
+    # 유사도가 낮은 순으로 정렬
+    heads_to_keep = sorted(heads_to_keep, key=lambda x: x[1])
+    # 상위 10개 head만 keep
+    heads_to_keep = heads_to_keep[:10]
+    print(f" - Heads to keep: {heads_to_keep}")
+    return heads_to_keep
+
+
+def main():
+    # -------------------- #
+    # 1) Argument Parsing
+    # -------------------- #
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model_name_or_path", 
+        type=str, 
+        default="facebook/wav2vec2-base-100h",
+        help="모델 이름 또는 경로"
+    )
+    parser.add_argument(
+        "--pruning_ratio",
+        type=float,
+        default=0.2,
+        help="최종적으로 남길 비율. ex) 0.1이면 전체의 10%만 남김"
+    )
+    parser.add_argument(
+        "--total_pruning_iterations",
+        type=int,
+        default=10,
+        help="Iterative Pruning을 몇 번 반복할지"
+    )
+    parser.add_argument(
+        "--iterative_finetune_epochs",
+        type=int,
+        default=2,
+        help="각 Iteration마다 미세튜닝할 epoch 수"
+    )
+    parser.add_argument(
+        "--final_finetune_epochs",
+        type=int,
+        default=50,
+        help="최종 Pruning 이후 미세튜닝 epoch 수"
+    )
+    parser.add_argument(
+        "--per_device_train_batch_size",
+        type=int,
+        default=4,
+        help="학습 배치 사이즈"
+    )
+    parser.add_argument(
+        "--distance_metric",
+        type=str,
+        default="cosine",
+        help="token-based distance 지표('cosine', 'corr', 'js', 'bc') 또는 sentence-based('dCor', 'PC', 'CC') 중 선택"
+    )
+    parser.add_argument(
+        "--test_mode",
+        action="store_true",
+        help="테스트 모드일 때 True로 설정하면 데이터셋을 매우 적게 사용"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="IHP_implementation",
+        help="모델 및 로그가 저장될 디렉토리"
+    )
+    args = parser.parse_args()
+
+
+    config = Wav2Vec2Config.from_pretrained(args.model_name_or_path, output_attentions=True)
+    processor = Wav2Vec2Processor.from_pretrained(args.model_name_or_path, config=config)
+    model = Wav2Vec2ForCTC.from_pretrained(
+        args.model_name_or_path, 
+        output_attentions=True,
+        ctc_loss_reduction="mean", 
+        pad_token_id=processor.tokenizer.pad_token_id,
+    )
+
+    print(f'config: {config}')
+
+
+    ### Stage 2. 데이터셋 준비
+    # LibriSpeech ASR 데이터셋 로드 (train-clean-100 및 validation-clean)
+    raw_train_dataset = load_dataset("Sreyan88/librispeech_asr", "clean", split="train.100")
+    raw_eval_dataset = load_dataset("Sreyan88/librispeech_asr", "clean", split="validation") # TODO: 비교를 위해서 validation 쓰고 있는데, test로 바꿔야함
+
+    chars_to_ignore_regex = r"[\,\?\.\!\-\;\:\"\“\%\‘\”\‘]"
+
+    print(f'raw_train_dataset.column_names : {raw_train_dataset.column_names}')
+    # train_dataset = raw_train_dataset.map(preprocess_function, batched=True)
+    # eval_dataset = raw_eval_dataset.map(preprocess_function, batched=True)
+    train_dataset = raw_train_dataset.map(preprocess_function, num_proc=4)
+    eval_dataset = raw_eval_dataset.map(preprocess_function, num_proc=4)
+    if args.test_mode: # 100개 데이터만 사용
+        train_dataset = train_dataset.select(range(100))
+        eval_dataset = eval_dataset.select(range(100))
+    print(train_dataset)
+    print(eval_dataset)
+
+    data_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
+
+    ### Stage 3. Iterative Head Pruning 수행
+    model.config.output_attentions = False # Pruning 후에는 attention 출력 끔
+    
+    training_args_1 = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.iterative_finetune_epochs,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        logging_steps=10,
+        learning_rate=1e-4,
+        fp16=True,  # GPU 사용 시
+        save_total_limit=1,
+        load_best_model_at_end=True,
+        metric_for_best_model="wer",
+        greater_is_better=False,
+        push_to_hub=False,
+        remove_unused_columns=False,
+    )
+    
+    def compute_metrics(pred):
+        pred_logits = pred.predictions
+        pred_ids = np.argmax(pred_logits, axis=-1)
+        # processor.decode를 이용해 토큰 id를 텍스트로 변환
+        pred_str = processor.batch_decode(pred_ids)
+        # 라벨도 문자열로 변환
+        label_ids = pred.label_ids
+        # 패딩(-100) 제거 및 문자열 변환
+        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+        label_str = processor.batch_decode(label_ids, group_tokens=False)
+        wer_metric = load("wer")
+        wer = wer_metric.compute(predictions=pred_str, references=label_str)
+        # print(f'pred_str: {pred_str}')
+        # print(f'label_str: {label_str}')
+        return {"wer": wer}
+
+    trainer_1 = Custom_Trainer(
+        model=model,
+        args=training_args_1,
+        data_collator=data_collator,
+        train_dataset=train_dataset,  # 준비된 데이터셋
+        eval_dataset=eval_dataset,
+        processing_class=processor,
+        processor=processor,
+        compute_metrics=compute_metrics,
+        compute_loss_func=my_compute_loss_ctc,
+    )
+
+    # 1) 초기 설정
+    init_num_layers = model.config.num_hidden_layers
+    init_num_heads = model.config.num_attention_heads
+    init_num_total_heads = init_num_layers * init_num_heads
+    # (전체 헤드 중 (1 - pruning_ratio)만큼을 10회에 걸쳐 제거)
+    heads_to_remove_per_step = int( init_num_total_heads * (1 - args.pruning_ratio) / args.total_pruning_iterations )
+    print(f"[초기설정] iteration x {args.total_pruning_iterations}, 최종 pruning_ratio={args.pruning_ratio}")
+    print(f"한 번에 제거할 head 수: {heads_to_remove_per_step}")
+
+    # 각 단계별로 이미 제거된 heads를 추적하기 위해, layer 단위로 set 사용
+    already_pruned_heads_dict = {layer_idx: set() for layer_idx in range(init_num_layers)}
+
+    # ======================== #
+    # 실제 Iterative Pruning 루프
+    # ======================== #
+    current_model = model
+    current_model.config.output_attentions = True  # attention 추출 허용
+    avg_attn_matrices = get_avg_attention_matrices(current_model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
+    heads_to_keep = find_heads_to_keep(avg_attn_matrices, already_pruned_heads_dict, init_num_total_heads, args) # [(head_idx, avg_similarity), ...]
+    print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들: {heads_to_keep}')
+
+    # heads_to_keep에 들어있는 head들 already_pruned_heads_dict에 추가
+    for (head_idx, _) in heads_to_keep:
+        layer_idx = head_idx // init_num_heads
+        head_idx_in_layer = head_idx % init_num_heads
+        already_pruned_heads_dict[layer_idx].add(head_idx_in_layer)
+    print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들 추가 후 already_pruned_heads_dict: {already_pruned_heads_dict}')
+
+    for iteration in range(args.total_pruning_iterations):
+        print(f"\n[Iteration {iteration+1}/{args.total_pruning_iterations}]")
+
+        # 3) 헤드 평가용 attention 추출 (랜덤 10샘플)
+        avg_attn_matrices = get_avg_attention_matrices(current_model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
+        # avg_attn_matrices: Tensor(init_num_layers, init_num_heads, seq_len, seq_len)
+
+        # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
+        current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
+        print(f" - 현재 남아있는 전체 헤드 수: {current_num_heads}")
+
+        # 이번 단계에서 제거할 head 수 계산(절대 개수)
+        n_remove = heads_to_remove_per_step
+        # 만약 현재 남은 head 수가 n_remove보다 작으면, 조정
+        if current_num_heads <= n_remove:
+            n_remove = current_num_heads - 1  # 최소 1개는 남김
+
+        # 4) 클러스터링 -> 제거 대상 head 선정
+        remove_candidates = cluster_and_select_heads(avg_attn_matrices, distance_metric=args.distance_metric, n_remove=n_remove, init_num_total_heads=init_num_total_heads, already_pruned_heads=already_pruned_heads_dict, test_mode=args.test_mode, init_num_heads=init_num_heads)
+        # remove_candidates: [(layer_idx, head_idx_in_layer), ...]
+        print(f''' - 제거할 head 후보: {remove_candidates}''')
+
+        # heads_to_prune_dict에 반영
+        # 이미 제거된 head는 빼고, 새롭게 제거될 head만 추가
+        layer_to_prune_dict = {} # ex) {0: [1,3,5,7,9,11], 1: [0,2,4,6,8,10], ...}
+        for (lyr_idx, h_idx) in remove_candidates:
+            # 이미 제거된 head면 skip
+            if h_idx in already_pruned_heads_dict[lyr_idx]:
+                print(f' - 이미 제거된 head 이니 건너뜀: ({lyr_idx}, {h_idx})')
+                continue
+            # 이 head까지 pruning하면 해당 layer에 더이상 남는 head가 없다면 skip
+            if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                print(f' - 이 head까지 제거하면 더이상 남는 head가 없어서 건너뜀: ({lyr_idx}, {h_idx})')
+                continue
+            layer_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
+            # already_pruned_heads_dict 갱신    
+            already_pruned_heads_dict[lyr_idx].add(h_idx)
+            
+        print(f" - Heads to prune: {layer_to_prune_dict}")
+        # 실제 prune 실행 (5) 헤드 프루닝
+        prune_wav2vec2_attention(current_model, layer_to_prune_dict)
+
+        print(f' - 현재까지 제거된 head: {already_pruned_heads_dict}')
+        print(f" - Iteration {iteration+1} 프루닝 완료")
+        
+        # 5) 프루닝 후 미세조정(Fine-tuning)
+        #    - 여기서는 시간 절약을 위해 적은 epoch로 실행
+        current_model.config.output_attentions = False
+        trainer_1.model = current_model  # Trainer에 프루닝된 모델 갱신
+        print(f" - Iteration {iteration+1} Fine-Tuning 시작")
+        trainer_1.train()
+
+        # 6) 모델 평가 및 저장
+        eval_metrics = trainer_1.evaluate()
+        print(f" - Iteration {iteration+1} 평가 결과(WER): {eval_metrics['eval_wer']:.4f}")
+        trainer_1.save_model(args.output_dir + f'/{iteration+1}iteration_pruned_model')
+
+        # (다음 iteration에서 다시 attention 뽑을 때를 위해)
+        current_model.config.output_attentions = True
+
     current_model.config.output_attentions = False
-    trainer_1.model = current_model  # Trainer에 프루닝된 모델 갱신
-    print(f" - Iteration {iteration+1} Fine-Tuning 시작")
-    trainer_1.train()
 
-    # 6) 모델 평가
-    eval_metrics = trainer_1.evaluate()
-    print(f" - Iteration {iteration+1} 평가 결과(WER): {eval_metrics['eval_wer']:.4f}")
+    print("\n[모든 Iteration 종료]")
+    print("최종 프루닝 완료 후 모델 저장/사용 등 후속 작업을 진행하세요.")
 
-    # (다음 iteration에서 다시 attention 뽑을 때를 위해)
-    current_model.config.output_attentions = True
+    # 필요한 경우 최종 모델 저장
+    trainer_1.save_model(args.output_dir + "/final_pruned_model")
 
-current_model.config.output_attentions = False
+    ### Stage 4. Final Fine-Tuning
+    # 저장한 최종 모델로 최종 fine-tuning
+    print("\n[최종 Fine-tuning 시작]")
+    # 최종 fine-tuning을 위한 Trainer 설정
+    training_args_2 = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.final_finetune_epochs,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        evaluation_strategy="epoch",
+        save_strategy="epoch",
+        logging_steps=10,
+        learning_rate=1e-4,
+        fp16=True,  # GPU 사용 시
+        save_total_limit=4,
+        load_best_model_at_end=True,
+        metric_for_best_model="wer",
+        greater_is_better=False,
+        push_to_hub=False,
+        remove_unused_columns=False,
+    )
+    trainer_2 = Custom_Trainer(
+        model=trainer_1.model,
+        args=training_args_2,
+        data_collator=data_collator,
+        train_dataset=train_dataset,  # 준비된 데이터셋
+        eval_dataset=eval_dataset,
+        processing_class=processor,
+        processor=processor,
+        compute_metrics=compute_metrics,
+        compute_loss_func=my_compute_loss_ctc,
+    )
 
-print("\n[모든 Iteration 종료]")
-print("최종 프루닝 완료 후 모델 저장/사용 등 후속 작업을 진행하세요.")
+    # 최종 fine-tuning 실행
+    trainer_2.train()
 
-# 필요한 경우 최종 모델 저장
-trainer_1.save_model(output_dir + "/final_pruned_model")
-
-
-
-### Stage 4. Final Fine-Tuning
-# 저장한 최종 모델로 최종 fine-tuning
-print("\n[최종 Fine-tuning 시작]")
-# 최종 fine-tuning을 위한 Trainer 설정
-training_args_2 = TrainingArguments(
-    output_dir=output_dir,
-    num_train_epochs=final_finetune_epochs,
-    per_device_train_batch_size=per_device_train_batch_size,
-    evaluation_strategy="epoch",
-    save_strategy="epoch",
-    logging_steps=10,
-    learning_rate=1e-4,
-    fp16=True,  # GPU 사용 시
-    save_total_limit=4,
-    load_best_model_at_end=True,
-    metric_for_best_model="wer",
-    greater_is_better=False,
-    push_to_hub=False,
-    remove_unused_columns=False,
-)
-trainer_2 = Custom_Trainer(
-    model=trainer_1.model,
-    args=training_args_2,
-    data_collator=data_collator,
-    train_dataset=train_dataset,  # 준비된 데이터셋
-    eval_dataset=eval_dataset,
-    processing_class=processor,
-    processor=processor,
-    compute_metrics=compute_metrics,
-    compute_loss_func=my_compute_loss_ctc,
-)
-
-# 최종 fine-tuning 실행
-trainer_2.train()
-
-print("\n[모든 작업 완료]")
-
-trainer_2 = Custom_Trainer(
-    model=model,
-    args=training_args_2,
-    data_collator=data_collator,
-    train_dataset=train_dataset,  # 준비된 데이터셋
-    eval_dataset=eval_dataset,
-    processing_class=processor,
-    processor=processor,
-    compute_metrics=compute_metrics,
-    compute_loss_func=my_compute_loss_ctc,
-)
-
-
-trainer_2.train()
+    print("\n[모든 작업 완료]")
+    
+if __name__ == "__main__":
+    main()
