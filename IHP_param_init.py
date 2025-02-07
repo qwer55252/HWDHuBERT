@@ -815,10 +815,9 @@ def main():
     # 각 단계별로 이미 제거된 heads를 추적하기 위해, layer 단위로 set 사용
     already_pruned_heads_dict = {layer_idx: set() for layer_idx in range(init_num_layers)}
 
-    current_model = model
     init_model = model
-    current_model.config.output_attentions = True  # attention 추출 허용
-    avg_attn_matrices = get_avg_attention_matrices(current_model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
+    model.config.output_attentions = True  # attention 추출 허용
+    avg_attn_matrices = get_avg_attention_matrices(model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
     heads_to_keep = find_heads_to_keep(avg_attn_matrices, already_pruned_heads_dict, init_num_total_heads, args) # [(head_idx, avg_similarity), ...]
     print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들: {heads_to_keep}')
 
@@ -829,9 +828,60 @@ def main():
     # ======================== #
     for iteration in range(args.total_pruning_iterations):
         print(f"\n[Iteration {iteration+1}/{args.total_pruning_iterations}]")
+        
+        step_i_model = deepcopy(init_model)
+        
+        # 실제 prune 실행 (5) 헤드 프루닝
+        # 이미 제거된 head는 빼고, 새롭게 제거될 head만 추가 for문
+        print(f' - pruning 전 현재까지 제거된 head: {already_pruned_heads_dict}')
+        heads_to_prune_dict = {} # ex) {0: [1,3,5,7,9,11], 1: [0,2,4,6,8,10], ...}        
+        for layer_idx, head_idx_in_layer in already_pruned_heads_dict.items(): # heads_to_prune_dict에 already_pruned_heads_dict에서 제거된 head들 추가
+            heads_to_prune_dict.setdefault(layer_idx, []).extend(list(head_idx_in_layer))
+        prune_wav2vec2_attention(step_i_model, heads_to_prune_dict) # heads_to_prune_dict 에는 이전 step에서 제거된 heads들과 현제 step에서 제거할 heads들이 모두 들어있음
+        print(f" - Iteration {iteration+1} 프루닝  완료")
+        print(f" - pruning 후 현제까지 제거된 head: {heads_to_prune_dict}")
+        
+        
+        # 5) 프루닝 후 미세조정(Fine-tuning) + 평가 및 저장
+        
+        step_i_model.config.output_attentions = False
+        training_args = TrainingArguments(
+            output_dir=args.output_dir,
+            num_train_epochs=args.iterative_finetune_epochs,
+            per_device_train_batch_size=args.per_device_train_batch_size,
+            evaluation_strategy="epoch",
+            save_strategy="epoch",
+            logging_steps=10,
+            learning_rate=1e-4,
+            fp16=True,  # GPU 사용 시
+            save_total_limit=1,
+            load_best_model_at_end=True,
+            metric_for_best_model="wer",
+            greater_is_better=False,
+            push_to_hub=False,
+            remove_unused_columns=False,
+        )
+        trainer_i = Custom_Trainer(
+            model=step_i_model,
+            args=training_args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,  # 준비된 데이터셋
+            eval_dataset=eval_dataset,
+            processing_class=processor,
+            processor=processor,
+            compute_metrics=compute_metrics,
+            compute_loss_func=my_compute_loss_ctc,
+        )
+        print(f" - Iteration {iteration+1} Fine-Tuning 시작")
+        trainer_i.train()
+        eval_metrics = trainer_i.evaluate()
+        print(f" - Iteration {iteration+1} 평가 결과(WER): {eval_metrics['eval_wer']:.4f}")
+        trainer_i.save_model(args.output_dir + f'/{iteration+1}iteration_pruned_model')
 
+        # (다음 iteration에서 다시 attention 뽑을 때를 위해)
+        step_i_model.config.output_attentions = True
         # 3) 헤드 평가용 attention 추출 (랜덤 10샘플)
-        avg_attn_matrices = get_avg_attention_matrices(current_model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
+        avg_attn_matrices = get_avg_attention_matrices(step_i_model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
         # avg_attn_matrices: Tensor(init_num_layers, init_num_heads, seq_len, seq_len)
 
         # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
@@ -849,16 +899,6 @@ def main():
         remove_candidates = cluster_and_select_heads(avg_attn_matrices, distance_metric=args.distance_metric, n_remove=n_remove, init_num_total_heads=init_num_total_heads, already_pruned_heads=already_pruned_heads_dict, test_mode=args.test_mode, init_num_heads=init_num_heads, heads_to_keep=heads_to_keep)
         # remove_candidates: [(layer_idx, head_idx_in_layer), ...]
         print(f''' - 제거할 head 후보: {remove_candidates}''')
-
-        # 이미 제거된 head는 빼고, 새롭게 제거될 head만 추가 for문
-        heads_to_prune_dict = {} # ex) {0: [1,3,5,7,9,11], 1: [0,2,4,6,8,10], ...}
-        
-        
-        # heads_to_prune_dict에 already_pruned_heads_dict에서 제거된 head들 추가
-        for layer_idx, head_idx_in_layer in already_pruned_heads_dict.items():
-            heads_to_prune_dict.setdefault(layer_idx, []).extend(list(head_idx_in_layer))
-            
-        print(f' - pruning 전 현재까지 제거된 head: {already_pruned_heads_dict}')
         
         for (lyr_idx, h_idx) in remove_candidates:
             if h_idx in already_pruned_heads_dict[lyr_idx]:
@@ -876,65 +916,11 @@ def main():
             # already_pruned_heads_dict 갱신    
             already_pruned_heads_dict[lyr_idx].add(h_idx)
         
-        step_i_model = deepcopy(init_model)
-        
-        
-        print(f" - pruning 후 현쟂까지 제거된 head: {heads_to_prune_dict}")
-        
-        # 실제 prune 실행 (5) 헤드 프루닝
-        prune_wav2vec2_attention(step_i_model, heads_to_prune_dict) # heads_to_prune_dict 에는 이전 step에서 제거된 heads들과 현제 step에서 제거할 heads들이 모두 들어있음
-
-        print(f" - Iteration {iteration+1} 프루닝  완료")
         
         # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
         current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
         print(f" - 현재 남아있는 전체 헤드 수: {current_num_heads}")
         
-        # 5) 프루닝 후 미세조정(Fine-tuning)
-        step_i_model.config.output_attentions = False
-        
-        training_args = TrainingArguments(
-            output_dir=args.output_dir,
-            num_train_epochs=args.iterative_finetune_epochs,
-            per_device_train_batch_size=args.per_device_train_batch_size,
-            evaluation_strategy="epoch",
-            save_strategy="epoch",
-            logging_steps=10,
-            learning_rate=1e-4,
-            fp16=True,  # GPU 사용 시
-            save_total_limit=1,
-            load_best_model_at_end=True,
-            metric_for_best_model="wer",
-            greater_is_better=False,
-            push_to_hub=False,
-            remove_unused_columns=False,
-        )
-    
-        trainer_i = Custom_Trainer(
-            model=step_i_model,
-            args=training_args,
-            data_collator=data_collator,
-            train_dataset=train_dataset,  # 준비된 데이터셋
-            eval_dataset=eval_dataset,
-            processing_class=processor,
-            processor=processor,
-            compute_metrics=compute_metrics,
-            compute_loss_func=my_compute_loss_ctc,
-        )
-        
-        print(f" - Iteration {iteration+1} Fine-Tuning 시작")
-        trainer_i.train()
-
-        # 6) 모델 평가 및 저장
-        eval_metrics = trainer_i.evaluate()
-        print(f" - Iteration {iteration+1} 평가 결과(WER): {eval_metrics['eval_wer']:.4f}")
-        trainer_i.save_model(args.output_dir + f'/{iteration+1}iteration_pruned_model')
-
-        # (다음 iteration에서 다시 attention 뽑을 때를 위해)
-        current_model = step_i_model
-        current_model.config.output_attentions = True
-
-    current_model.config.output_attentions = False
 
     print("\n[모든 Iteration 종료]")
     print("최종 프루닝 완료 후 모델 저장/사용 등 후속 작업을 진행하세요.")
