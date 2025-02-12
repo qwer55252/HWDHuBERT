@@ -607,7 +607,14 @@ def cluster_and_select_heads(attn_matrices, distance_metric="cosine", n_remove=5
     for c_id, head_indices in cluster_head_dict.items():
         if c_id == -1:
             continue
-        rep_head_idx = np.random.choice(head_indices)  # 랜덤 대표
+        # 기존 랜덤 대표 구하는 방식에서 Redundancy 낮은 Head를 클러스터 대표로 선정하여 살리는 방식으로 수정
+        rep_head_idx = head_indices[0]
+        min_sim = similarity_matrix[rep_head_idx].mean()
+        for head_idx in head_indices:
+            if similarity_matrix[head_idx].mean() < min_sim:
+                min_sim = similarity_matrix[head_idx].mean()
+                rep_head_idx = head_idx
+        
         cluster_to_rep[c_id] = rep_head_idx
     print(f'cluster_to_rep: {cluster_to_rep}')
 
