@@ -306,7 +306,7 @@ def main():
     parser.add_argument(
         "--already_pruned_heads_dict", 
         type=json.loads,  # json.loads로 변경
-        required=True,
+        required=False,
         help="프루닝된 헤드 정보 딕셔너리"
     )
     parser.add_argument(
@@ -360,9 +360,21 @@ def main():
         pad_token_id=processor.tokenizer.pad_token_id,
     )
     
-    already_pruned_heads_dict = args.already_pruned_heads_dict # dict인데 str로 받아서 dict로 변환 필요 
-    already_pruned_heads_dict = {int(k): v for k, v in already_pruned_heads_dict.items()} # ex) {0: [1,3,5,7,9,11], 1: [0,2,4,6,8,10], ...}
+    # already_pruned_heads_dict = args.already_pruned_heads_dict # dict인데 str로 받아서 dict로 변환 필요 
+    # already_pruned_heads_dict = {int(k): v for k, v in already_pruned_heads_dict.items()} # ex) {0: [1,3,5,7,9,11], 1: [0,2,4,6,8,10], ...}
     
+    
+    already_pruned_heads_dict = {}
+    # print(f'state_dict.items(): {state_dict.items()}')
+    for key, tensor in state_dict.items(): # key ex: wav2vec2.encoder.layers.0.attention.q_proj.bias
+        if "attention.q_proj.weight" in key:
+            # print(f'key: {key}') # key: wav2vec2.encoder.layers.0.attention.q_proj.weight
+            layer = int(key.split('.')[3]) # ex) 0
+            num_heads = tensor.shape[0] // 64
+            # print(f'num_heads: {num_heads}')
+            # print(f"{key}: {tensor.shape}, remaining heads: {num_heads}")
+            already_pruned_heads_dict[layer] = [i for i in range(12-num_heads)]
+            # print(f'already_pruned_heads_dict: {already_pruned_heads_dict}')
     
     
     
