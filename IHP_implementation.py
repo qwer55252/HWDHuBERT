@@ -839,16 +839,16 @@ def main():
     # ======================== #
     current_model = model
     current_model.config.output_attentions = True  # attention 추출 허용
-    avg_attn_matrices = get_avg_attention_matrices(current_model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
-    heads_to_keep = find_heads_to_keep(avg_attn_matrices, already_pruned_heads_dict, init_num_total_heads, args) # [(head_idx, avg_similarity), ...]
-    print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들: {heads_to_keep}')
+    # avg_attn_matrices = get_avg_attention_matrices(current_model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
+    # heads_to_keep = find_heads_to_keep(avg_attn_matrices, already_pruned_heads_dict, init_num_total_heads, args) # [(head_idx, avg_similarity), ...]
+    # print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들: {heads_to_keep}')
 
-    # heads_to_keep에 들어있는 head들 already_pruned_heads_dict에 추가
-    for (head_idx, _) in heads_to_keep:
-        layer_idx = head_idx // init_num_heads
-        head_idx_in_layer = head_idx % init_num_heads
-        already_pruned_heads_dict[layer_idx].add(head_idx_in_layer)
-    print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들 추가 후 already_pruned_heads_dict: {already_pruned_heads_dict}')
+    # # heads_to_keep에 들어있는 head들 already_pruned_heads_dict에 추가
+    # for (head_idx, _) in heads_to_keep:
+    #     layer_idx = head_idx // init_num_heads
+    #     head_idx_in_layer = head_idx % init_num_heads
+    #     already_pruned_heads_dict[layer_idx].add(head_idx_in_layer)
+    # print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들 추가 후 already_pruned_heads_dict: {already_pruned_heads_dict}')
 
     for iteration in range(args.total_pruning_iterations):
         print(f"\n[Iteration {iteration+1}/{args.total_pruning_iterations}]")
