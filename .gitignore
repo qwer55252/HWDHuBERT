@@ -1,0 +1,5 @@
+results/*
+result_eval/*
+wandb/*
+__pycache__/*
+*.txt
