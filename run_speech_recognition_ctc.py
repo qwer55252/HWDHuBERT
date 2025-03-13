@@ -277,6 +277,59 @@ def create_vocabulary_from_data(
 # ------------------------------------------------------------------------------------
 # ---- distillation changes START: custom DistilCTCTrainer for teacher-student
 # ------------------------------------------------------------------------------------
+
+class Custom_Trainer(Trainer):
+    def __init__(self, processor, teacher, conv_layer, distill_weight=0.5, *args, **kwargs):
+        """
+        Args:
+            processor: CTCLoss 계산에 사용될 processor.
+            teacher: distillation을 위한 teacher 모델.
+            conv_layer: 1x1 Conv layer (nn.Conv2d 또는 nn.Conv1d 등)로 attention maps의 차원을 맞추기 위한 모듈.
+            distill_weight: distillation loss에 부여할 가중치.
+        """
+        super().__init__(*args, **kwargs)
+        self.processor = processor
+        self.teacher = teacher
+        self.conv_layer = conv_layer
+        self.distill_weight = distill_weight
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # labels 추출
+        labels = inputs.pop("labels")
+        
+        # Student 모델 forward pass
+        student_outputs = model(**inputs)
+        
+        # Teacher 모델 forward pass (gradient 계산 제외)
+        with torch.no_grad():
+            teacher_outputs = self.teacher(**inputs)
+        
+        # 주 loss: CTCLoss 계산
+        ctc_loss = my_compute_loss_ctc(student_outputs, labels, self.processor)
+        
+        # distillation loss 계산:
+        # 여기서는 각 모델의 attention maps가 outputs.attentions 에 리스트 형태로 저장되어 있다고 가정합니다.
+        # 각 attention map의 shape: (batch, num_heads, seq_len, seq_len)
+        # 1x1 Conv layer를 사용하여 각 attention map의 채널(또는 head 차원)을 동일 차원으로 매핑합니다.
+        student_atts = student_outputs.attentions  # list of tensors
+        teacher_atts = teacher_outputs.attentions
+        
+        distill_loss = 0.0
+        num_layers = len(student_atts)
+        for s_att, t_att in zip(student_atts, teacher_atts):
+            # 예를 들어, Conv2d를 사용했다고 가정 (입력 채널: num_heads, 출력 채널: fixed_dim)
+            # 입력 shape: (batch, num_heads, seq_len, seq_len)
+            s_map = self.conv_layer(s_att)  # shape: (batch, fixed_dim, seq_len, seq_len)
+            t_map = self.conv_layer(t_att)  # 같은 shape으로 매핑
+            distill_loss += F.mse_loss(s_map, t_map)
+        # 각 레이어별 loss 평균
+        distill_loss = distill_loss / num_layers
+        
+        # 최종 loss: CTC loss + distillation loss weighted
+        total_loss = ctc_loss + self.distill_weight * distill_loss
+        
+        return (total_loss, student_outputs) if return_outputs else total_loss
+
 class DistilCTCTrainer(Trainer):
     """
     Custom Trainer that computes a distillation loss for teacher-student training.

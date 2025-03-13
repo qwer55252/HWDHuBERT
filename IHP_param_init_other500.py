@@ -764,8 +764,11 @@ def main():
 
     ### Stage 2. 데이터셋 준비
     # LibriSpeech ASR 데이터셋 로드 (train-clean-100 및 validation-clean)
-    raw_train_dataset = load_dataset("openslr/librispeech_asr", "clean", split="train.100+train.360")
-    raw_eval_dataset = load_dataset("openslr/librispeech_asr", "clean", split="validation")
+    # raw_train_dataset = load_dataset("openslr/librispeech_asr", "other", split="train.500")
+    # raw_dev_dataset = load_dataset("openslr/librispeech_asr", "other", split="dev")
+    # raw_test_dataset = load_dataset("openslr/librispeech_asr", "other", split="test")
+    raw_train_dataset = load_dataset("Sreyan88/librispeech_asr", "other", split="train.500")
+    raw_test_dataset = load_dataset("Sreyan88/librispeech_asr", "other", split="test")
     # raw_train_dataset = load_dataset("Sreyan88/librispeech_asr", "all", split="train.100")
     # raw_eval_dataset = load_dataset("Sreyan88/librispeech_asr", "all", split="validation")
 
@@ -773,14 +776,20 @@ def main():
 
     print(f'raw_train_dataset.column_names : {raw_train_dataset.column_names}')
     # train_dataset = raw_train_dataset.map(preprocess_function, batched=True)
-    # eval_dataset = raw_eval_dataset.map(preprocess_function, batched=True)
+    # test_dataset = raw_test_dataset.map(preprocess_function, batched=True)
     train_dataset = raw_train_dataset.map(preprocess_function, num_proc=4)
-    eval_dataset = raw_eval_dataset.map(preprocess_function, num_proc=4)
+    # dev_dataset = raw_dev_dataset.map(preprocess_function, num_proc=4)
+    test_dataset = raw_test_dataset.map(preprocess_function, num_proc=4)
+    
+    
     if args.test_mode: # 100개 데이터만 사용
         train_dataset = train_dataset.select(range(100))
-        eval_dataset = eval_dataset.select(range(100))
+        dev_dataset = dev_dataset.select(range(100))
+        test_dataset = test_dataset.select(range(100))
     print(train_dataset)
-    print(eval_dataset)
+    # print(dev_dataset)
+    print(test_dataset)
+    
 
     data_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
 
@@ -869,7 +878,7 @@ def main():
             args=training_args,
             data_collator=data_collator,
             train_dataset=train_dataset,  # 준비된 데이터셋
-            eval_dataset=eval_dataset,
+            eval_dataset=test_dataset,
             processing_class=processor,
             processor=processor,
             compute_metrics=compute_metrics,
@@ -961,7 +970,7 @@ def main():
         args=training_args_2,
         data_collator=data_collator,
         train_dataset=train_dataset,  # 준비된 데이터셋
-        eval_dataset=eval_dataset,
+        eval_dataset=test_dataset,
         processing_class=processor,
         processor=processor,
         compute_metrics=compute_metrics,
