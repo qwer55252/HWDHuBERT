@@ -61,18 +61,71 @@ class DataCollatorCTCWithPadding:
         return batch
 
 class Custom_Trainer(Trainer):
-    def __init__(self, processor, *args, **kwargs):
+    def __init__(self, processor, teacher, already_pruned_heads_dict, distill_weight=0.5, *args, **kwargs):
+        """
+        Args:
+            processor: CTCLoss 계산에 사용될 processor.
+            teacher: distillation을 위한 teacher 모델.
+            distill_weight: distillation loss에 부여할 가중치.
+        """
         super().__init__(*args, **kwargs)
         self.processor = processor
+        self.teacher = teacher
+        self.distill_weight = distill_weight
+        self.already_pruned_heads_dict = already_pruned_heads_dict
+        self.conv_layer = nn.ModuleList()
+        
+        # teacher 모델에서 layer당 head 수 구함
+        num_head_per_layer = teacher.config.num_attention_heads
+        # num_head_per_layer, already_pruned_heads_dict 이용해서 layer별로 1x1 Conv 정의
+        for layer_idx, pruned_heads in already_pruned_heads_dict.items():
+            num_pruned_heads = len(pruned_heads)
+            student_heads = num_head_per_layer - num_pruned_heads
+            # 1x1 Conv 정의
+            self.conv_layer.append(nn.Conv1d(student_heads, num_head_per_layer, kernel_size=1, bias=False))
+        self.conv_layer.to(self.teacher.device)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # labels 추출
+        # 1. labels 추출
         labels = inputs.pop("labels")
-        # 모델 실행
-        outputs = model(**inputs)
-        # CTCLoss 계산에 self.processor 사용
-        loss = my_compute_loss_ctc(outputs, labels, self.processor)
-        return (loss, outputs) if return_outputs else loss
+        
+        # 2. Student 모델 forward pass
+        student_outputs = model(**inputs, output_attentions=True)
+        
+        # 3. Teacher 모델 forward pass (gradient 계산 제외)
+        with torch.no_grad():
+            teacher_outputs = self.teacher(**inputs, output_attentions=True)
+        
+        # 4. CTCLoss 계산
+        ctc_loss = my_compute_loss_ctc(student_outputs, labels, self.processor)
+        
+        if (student_outputs.attentions is None) or (teacher_outputs.attentions is None):
+            distill_loss = 0.0
+        else:
+            distill_loss_total = 0.0
+            n_layers = len(student_outputs.attentions)
+            # 각 레이어별 attention distillation loss 계산
+            for i, (s_att, t_att) in enumerate(zip(student_outputs.attentions, teacher_outputs.attentions)):
+                # s_att: (B, student_heads, seq_len, seq_len)
+                # t_att: (B, teacher_heads, seq_len, seq_len)
+                B, s_heads, L, _ = s_att.shape
+                # 1. 학생의 attention map을 (B, student_heads, L*L)로 reshape
+                s_att_reshaped = s_att.view(B, s_heads, L * L)
+                # 2. 해당 레이어의 Conv1d를 적용 (입력: student_heads, 출력: teacher_heads)
+                s_transformed = self.conv_layer[i](s_att_reshaped)  # (B, teacher_heads, L*L)
+                # 3. 다시 (B, teacher_heads, L, L)로 reshape
+                s_transformed = s_transformed.view(B, t_att.shape[1], L, L)
+                # 4. 각 레이어의 MSE loss 계산
+                layer_loss = F.mse_loss(s_transformed, t_att)
+                distill_loss_total += layer_loss
+            distill_loss = distill_loss_total / n_layers
+        
+        # 8. 최종 loss: CTCLoss와 distillation loss의 weighted 합
+        total_loss = ctc_loss + self.distill_weight * distill_loss
+        print(f'''CTC Loss: {ctc_loss.item()}, Distillation Loss: {distill_loss.item()}, Total Loss: {total_loss.item()}''')
+        
+        return (total_loss, student_outputs) if return_outputs else total_loss
+
 
 # =============== #
 # Token-based distance 함수들
@@ -727,7 +780,7 @@ def main():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=4,
+        default=2,
         help="학습 배치 사이즈"
     )
     parser.add_argument(
@@ -746,6 +799,12 @@ def main():
         type=str,
         default="IHP_implementation",
         help="모델 및 로그가 저장될 디렉토리"
+    )
+    parser.add_argument(
+        "--per_device_eval_batch_size",
+        type=int,
+        default=2,
+        help="평가 배치 사이즈"
     )
     args = parser.parse_args()
 
@@ -776,6 +835,7 @@ def main():
     # eval_dataset = raw_eval_dataset.map(preprocess_function, batched=True)
     train_dataset = raw_train_dataset.map(preprocess_function, num_proc=4)
     eval_dataset = raw_eval_dataset.map(preprocess_function, num_proc=4)
+    eval_dataset = eval_dataset.select(range(800))
     if args.test_mode: # 100개 데이터만 사용
         train_dataset = train_dataset.select(range(100))
         eval_dataset = eval_dataset.select(range(100))
@@ -787,9 +847,44 @@ def main():
     ### Stage 3. Iterative Head Pruning 수행
     model.config.output_attentions = False # Pruning 후에는 attention 출력 끔
     
+    # def compute_metrics(pred):
+    #     pred_logits = pred.predictions
+    #     # 보통 pred_logits는 (num_examples, seq_len, vocab_size) 형태여야 함
+    #     pred_ids = np.argmax(pred_logits, axis=-1)  # (num_examples, seq_len)
+    #     # flat list로 변환
+    #     pred_ids_list = pred_ids.tolist()
+        
+    #     # 참조 레이블의 shape로부터 예상되는 예측 개수를 계산 (예: (batch_size, seq_len))
+    #     batch_size, seq_len = pred.label_ids.shape
+    #     expected_num = batch_size * seq_len
+    #     if len(pred_ids_list) != expected_num:
+    #         print(f"Warning: flat pred_ids length {len(pred_ids_list)} != expected {expected_num}. Trimming.")
+    #         pred_ids_list = pred_ids_list[:expected_num]
+        
+    #     # 2차원 리스트로 재구성: 각 평가 샘플을 하나의 시퀀스로 인식
+    #     pred_ids_list = [pred_ids_list[i * seq_len:(i + 1) * seq_len] for i in range(batch_size)]
+    #     pred_str = processor.batch_decode(pred_ids_list, skip_special_tokens=True)
+        
+    #     label_ids = pred.label_ids
+    #     label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+    #     label_ids_list = label_ids.tolist()
+    #     label_str = processor.batch_decode(label_ids_list, group_tokens=False, skip_special_tokens=True)
+    #     print("예측:", pred_str[:5])
+    #     print("레이블:", label_str[:5])
+    #     wer_metric = load("wer")
+    #     wer = wer_metric.compute(predictions=pred_str, references=label_str)
+    #     return {"wer": wer}
+
+    
     
     def compute_metrics(pred):
-        pred_logits = pred.predictions
+        pred_logits = pred.predictions  # (batch_size * seq_len, vocab_size)
+        batch_size = pred.label_ids.shape[0]
+        seq_len = pred_logits.shape[0] // batch_size
+        # 명시적으로 reshape
+        pred_logits = pred_logits.reshape(batch_size, seq_len, -1)
+        
+        
         pred_ids = np.argmax(pred_logits, axis=-1)
         # processor.decode를 이용해 토큰 id를 텍스트로 변환
         pred_str = processor.batch_decode(pred_ids)
@@ -818,7 +913,9 @@ def main():
     # 각 단계별로 이미 제거된 heads를 추적하기 위해, layer 단위로 set 사용
     already_pruned_heads_dict = {layer_idx: set() for layer_idx in range(init_num_layers)}
 
+    model = model.to('cuda')
     init_model = model
+    print(f'init_model.device: {init_model.device}')
     model.config.output_attentions = True  # attention 추출 허용
     avg_attn_matrices = get_avg_attention_matrices(model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
     heads_to_keep = find_heads_to_keep(avg_attn_matrices, already_pruned_heads_dict, init_num_total_heads, args) # [(head_idx, avg_similarity), ...]
@@ -847,7 +944,7 @@ def main():
         
         # 5) 프루닝 후 미세조정(Fine-tuning) + 평가 및 저장
         
-        step_i_model.config.output_attentions = False
+        
         training_args = TrainingArguments(
             output_dir=args.output_dir,
             num_train_epochs=args.iterative_finetune_epochs,
@@ -864,16 +961,23 @@ def main():
             push_to_hub=False,
             remove_unused_columns=False,
         )
+        # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
+        current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
+
+        print(f'step_i_model.device: {step_i_model.device}')
         trainer_i = Custom_Trainer(
             model=step_i_model,
             args=training_args,
             data_collator=data_collator,
-            train_dataset=train_dataset,  # 준비된 데이터셋
+            train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=processor,
             processor=processor,
             compute_metrics=compute_metrics,
             compute_loss_func=my_compute_loss_ctc,
+            teacher=init_model,
+            distill_weight=0.5,
+            already_pruned_heads_dict=already_pruned_heads_dict,
         )
         print(f" - Iteration {iteration+1} Fine-Tuning 시작")
         trainer_i.train()
@@ -883,12 +987,10 @@ def main():
 
         # (다음 iteration에서 다시 attention 뽑을 때를 위해)
         step_i_model.config.output_attentions = True
+        init_model.config.output_attentions = True
         # 3) 헤드 평가용 attention 추출 (랜덤 10샘플)
         avg_attn_matrices = get_avg_attention_matrices(step_i_model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
         # avg_attn_matrices: Tensor(init_num_layers, init_num_heads, seq_len, seq_len)
-
-        # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
-        current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
 
         # 이번 단계에서 제거할 head 수 계산(절대 개수)
         n_remove = heads_to_remove_per_step
@@ -934,9 +1036,10 @@ def main():
     
     ### Stage 4. Final Fine-Tuning
     # 저장한 최종 모델로 최종 fine-tuning
-    final_finetune_model = init_model # 여기선 deepcopy 굳이 안씀
+    final_finetune_model = deepcopy(init_model)
     prune_wav2vec2_attention(final_finetune_model, already_pruned_heads_dict)
-    final_finetune_model.config.output_attentions = False
+    final_finetune_model.config.output_attentions = True
+    init_model.config.output_attentions = True
     
     print("\n[최종 Fine-tuning 시작]")
     # 최종 fine-tuning을 위한 Trainer 설정
@@ -944,6 +1047,7 @@ def main():
         output_dir=args.output_dir,
         num_train_epochs=args.final_finetune_epochs,
         per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
         evaluation_strategy="epoch",
         save_strategy="epoch",
         logging_steps=10,
@@ -960,12 +1064,15 @@ def main():
         model=final_finetune_model,
         args=training_args_2,
         data_collator=data_collator,
-        train_dataset=train_dataset,  # 준비된 데이터셋
+        train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         processing_class=processor,
         processor=processor,
         compute_metrics=compute_metrics,
         compute_loss_func=my_compute_loss_ctc,
+        teacher=init_model,
+        distill_weight=0.5,
+        already_pruned_heads_dict=already_pruned_heads_dict,
     )
 
     # 최종 fine-tuning 실행
