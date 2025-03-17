@@ -74,6 +74,7 @@ class Custom_Trainer(Trainer):
         self.distill_weight = distill_weight
         self.already_pruned_heads_dict = already_pruned_heads_dict
         self.conv_layer = nn.ModuleList()
+        self.is_in_train = True
         
         # teacher 모델에서 layer당 head 수 구함
         num_head_per_layer = teacher.config.num_attention_heads
