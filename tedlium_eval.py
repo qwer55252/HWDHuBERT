@@ -86,7 +86,25 @@ def compute_metrics(pred, processor):
     label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
     label_str = processor.batch_decode(label_ids, group_tokens=False)
     wer_metric = load("wer")
-    wer = wer_metric.compute(predictions=pred_str, references=label_str)
+    new_pred_str = []
+    new_label_str = []
+    for i in range(len(label_str)):
+        if label_str[i] == "IGNORE<unk>TIME<unk>SEGMENT<unk>IN<unk>SCORING":
+            continue
+        else:
+            if "'" in pred_str[i]:
+                pred_str[i] = pred_str[i].replace("'", " '")
+            new_pred_str.append(pred_str[i])
+            new_label_str.append(label_str[i])
+
+    wer = wer_metric.compute(predictions=new_pred_str, references=new_label_str)
+    
+    for pred_text, label_text in zip(new_pred_str, new_label_str):
+        print(f'pred_text: {pred_text}')
+        print(f'label_text: {label_text}')
+        single_wer = wer_metric.compute(predictions=[pred_text], references=[label_text])
+        print(f'wer: {single_wer}')
+    
     return {"wer": wer}
 
 def preprocess_function(batch):
@@ -97,8 +115,9 @@ def preprocess_function(batch):
     
     # batch["text"] == "ignore_time_segment_in_scoring" 이면 해당 데이터 제외
     # if batch["text"] == "ignore_time_segment_in_scoring":
-    #     return None
-    
+    #     batch["text"] = " "
+    # if "'"  in batch["text"]: # I'M -> I 'M
+    #     batch["text"] = batch["text"].replace("'", " '")
     if batch["text"] and isinstance(batch["text"], list): # batch["text"] 가 list이면
         batch["text"] = [text.upper() for text in batch["text"]]
     elif batch["text"] and isinstance(batch["text"], str): # batch["text"] 가 str이면
