@@ -66,12 +66,12 @@ def _make_builder_configs():
         """,
         url="https://www.openslr.org/7/",
         download_urls={
-            # "train": [_DL_URL + os.path.join("TEDLIUM_release1", "train.tar.gz")], # train 제외하고 load
+            "train": [_DL_URL + os.path.join("TEDLIUM_release1", "train.tar.gz")],
             "validation": [_DL_URL + os.path.join("TEDLIUM_release1", "dev.tar.gz")],
             "test": [_DL_URL + os.path.join("TEDLIUM_release1", "test.tar.gz")],
         },
         split_paths=[
-            # (datasets.Split.TRAIN, "train"), # train 제외하고 load
+            (datasets.Split.TRAIN, "train"),
             (datasets.Split.VALIDATION, "dev"),
             (datasets.Split.TEST, "test"),
         ],
