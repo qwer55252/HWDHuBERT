@@ -1,0 +1,25 @@
+{
+    // IntelliSense를 사용하여 가능한 특성에 대해 알아보세요.
+    // 기존 특성에 대한 설명을 보려면 가리킵니다.
+    // 자세한 내용을 보려면 https://go.microsoft.com/fwlink/?linkid=830387을(를) 방문하세요.
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: train IRHP TEDLIUM",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_IRHP_tedlium.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--per_device_train_batch_size", "4",
+                "--output_dir", "outputs/tedlium",
+                "--method", "redundancy-based",
+                "--dataset", "tedlium",
+                "--test_mode"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "2"
+            }
+        }
+    ]
+}

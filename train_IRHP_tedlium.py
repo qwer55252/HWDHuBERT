@@ -1,3 +1,4 @@
+import re
 import torch
 import random
 import argparse
@@ -355,8 +356,6 @@ def prune_wav2vec2_attention(model, heads_to_prune_dict):
         # layer_module.attention: Wav2Vec2Attention
         prune_wav2vec2_attention_layer(layer_module.attention, prune_head_list, model.config)
 
-def preprocess_function(batch):
-    return batch
 
 
 def my_compute_loss_ctc(outputs, labels, processor=None, blank_token_id=None, num_items_in_batch=None):
@@ -646,7 +645,6 @@ def find_remaining_heads(already_pruned_heads_dict, init_num_total_heads): # 현
     remaining_heads_num = init_num_total_heads - pruned_heads_num
     return remaining_heads_num
 
-    
 def find_heads_to_keep(attn_matrices, already_pruned_heads_dict, init_num_total_heads, args):  # 제거하지 말아야 할 Head 찾아서, already_pruned_heads_dict에 추가
     seq_len = attn_matrices.size(-1)
 
@@ -689,6 +687,50 @@ def find_heads_to_keep(attn_matrices, already_pruned_heads_dict, init_num_total_
     print(f" - Heads to keep: {heads_to_keep}")
     return heads_to_keep
 
+def preprocess_function(batch, processor):
+    # 1) 오디오 인풋 처리
+    input_values = processor(
+        batch["audio"]["array"],
+        sampling_rate=16_000
+    ).input_values[0]
+    
+    batch["text"] = clean_transcript(batch["text"])  # 텍스트 전처리
+    # 2) 텍스트 라벨은 tokenizer를 직접 호출
+    labels = processor.tokenizer(
+        batch["text"]
+    ).input_ids
+    
+    return {
+        "input_values": input_values,
+        "labels": labels,
+    }
+
+def clean_transcript(text):
+    text = re.sub(r"\{.*?\}", "", text)              # {SMACK}, {BREATH} 등 제거
+    text = re.sub(r"\(.*?\)", "", text)              # (2), (3) 등 제거
+    text = text.replace("<sil>", "")                 # <sil> 제거
+    text = text.upper()                              # 모두 대문자
+    text = re.sub(r"[^A-Z' ]+", "", text)            # A–Z, 공백, ' 만 남기고 제거
+    text = re.sub(r"\s+", " ", text).strip()         # 중복 공백 정리
+    return text
+
+def load_datasets(dataset_name):
+    if dataset_name == "librispeech":
+        train_dataset = load_dataset("openslr/librispeech_asr", "clean", split="train.100")
+        dev_dataset = load_dataset("openslr/librispeech_asr", "clean", split="validation")
+        test_dataset = load_dataset("openslr/librispeech_asr", "clean", split="test")
+    elif dataset_name == "tedlium":
+        train_dataset = load_dataset("./tedlium_test.py", "release1", split="train", trust_remote_code=True)
+        dev_dataset = load_dataset("./tedlium_test.py", "release1", split="validation", trust_remote_code=True)
+        test_dataset = load_dataset("./tedlium_test.py", "release1", split="test", trust_remote_code=True)
+        MAX_SAMPLES = 160000  # 10초
+        train_dataset = train_dataset.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
+        dev_dataset = dev_dataset.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
+        test_dataset = test_dataset.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    
+    return train_dataset, dev_dataset, test_dataset
 
 def main():
     # -------------------- #
@@ -754,6 +796,12 @@ def main():
         default="redundancy-based",
         help="[redundancy-based, magnitude-based, l0-based, one-shot]"
     )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="librispeech",
+        help="[librispeech, tedlium]"
+    )
     args = parser.parse_args()
 
 
@@ -771,40 +819,28 @@ def main():
 
     ### Stage 2. 데이터셋 준비
     # LibriSpeech ASR 데이터셋 로드 (train-clean-100 및 validation-clean)
-    raw_train_dataset = load_dataset("./tedlium_test.py", "release1", split="train", trust_remote_code=True)
-    raw_dev_dataset = load_dataset("./tedlium_test.py", "release1", split="validation", trust_remote_code=True)
-    raw_test_dataset = load_dataset("./tedlium_test.py", "release1", split="test", trust_remote_code=True)
-    # raw_train_dataset = load_dataset("Sreyan88/librispeech_asr", "all", split="train.100")
-    # raw_eval_dataset = load_dataset("Sreyan88/librispeech_asr", "all", split="validation")
-    
-    MAX_SAMPLES = 160000  # 10초
-    raw_train_dataset = raw_train_dataset.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
-    raw_dev_dataset = raw_dev_dataset.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
-    raw_test_dataset = raw_test_dataset.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
-    
-    # LibriSpeech test-clean, test-other 데이터셋 로드
-    
-
-    # 필요한 경우 전처리 (예제에서는 identity mapping)
-    raw_test_dataset = raw_test_dataset.map(preprocess_function, num_proc=4)
-    print(f'test_dataset.column_names: {raw_test_dataset.column_names}')
-    print(f'test_dataset: {raw_test_dataset}')
-    print(f'raw_train_dataset.column_names : {raw_train_dataset.column_names}')
-
-    train_dataset = raw_train_dataset.map(preprocess_function, num_proc=4)
-    dev_dataset = raw_dev_dataset.map(preprocess_function, num_proc=4)
-    test_dataset = raw_test_dataset.map(preprocess_function, num_proc=4)
-
-    
+    train_dataset, dev_dataset, test_dataset = load_datasets(args.dataset)
     if args.test_mode: # 100개 데이터만 사용
         train_dataset = train_dataset.select(range(100))
-        dev_dataset = train_dataset.select(range(100))
+        dev_dataset = dev_dataset.select(range(100))
         test_dataset = test_dataset.select(range(100))
+        
+    # 필요한 경우 전처리
+    train_dataset = train_dataset.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
+    dev_dataset = dev_dataset.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
+    test_dataset = test_dataset.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
+    
+    # (4) 샘플 내부 구조와 일부 값 확인
+    for split, ds in (("train", train_dataset), ("dev", dev_dataset), ("test", test_dataset)):
+        sample = ds[0]
+        print(f"\n--- {split} sample #0 ---")
+        print("input_values:", sample["input_values"][:10], "… (len:", len(sample["input_values"]), ")")
+        print("labels:", sample["labels"][:10], "…")
     print(train_dataset)
     print(dev_dataset)
     print(test_dataset)
-    eval_datasets = {"dev": dev_dataset, "test": test_dataset}
-
+    eval_datasets = {"dev": dev_dataset, "test": test_dataset} # TODO: 정상작동하는지 확인
+    # eval_datasets = test_dataset
     data_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
 
     ### Stage 3. Iterative Head Pruning 수행
@@ -815,12 +851,33 @@ def main():
         pred_logits = pred.predictions
         pred_ids = np.argmax(pred_logits, axis=-1)
         # processor.decode를 이용해 토큰 id를 텍스트로 변환
-        pred_str = processor.batch_decode(pred_ids)
-        # 라벨도 문자열로 변환
-        label_ids = pred.label_ids
-        # 패딩(-100) 제거 및 문자열 변환
-        label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-        label_str = processor.batch_decode(label_ids, group_tokens=False)
+        if args.dataset == "librispeech":
+            pred_str = processor.batch_decode(pred_ids)
+            # 라벨도 문자열로 변환
+            label_ids = pred.label_ids
+            # 패딩(-100) 제거 및 문자열 변환
+            label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+            label_str = processor.batch_decode(label_ids, group_tokens=False)
+        elif args.dataset == "tedlium":
+            pred_str = processor.batch_decode(
+                pred_ids,
+                skip_special_tokens=True,
+                group_tokens=True,
+            )
+
+            # 레퍼런스(레이블) 디코딩: -100은 무시, 빈 토큰 제거
+            label_ids = pred.label_ids.copy()
+            # -100로 표시된 부분은 토크나이저가 skip_special_tokens로 알아서 무시하게 두거나,
+            # pad_token_id로 대체한 뒤 skip_special_tokens=True 로 지워지도록.
+            label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+            label_str = processor.batch_decode(
+                label_ids,
+                skip_special_tokens=True,
+                group_tokens=True,
+            )
+        else:
+            raise ValueError(f"Unknown dataset: {args.dataset}")
+        
         wer_metric = load("wer")
         wer = wer_metric.compute(predictions=pred_str, references=label_str)
         # print(f'pred_str: {pred_str}')
