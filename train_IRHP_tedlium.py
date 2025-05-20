@@ -748,6 +748,12 @@ def main():
         default="IHP_implementation",
         help="모델 및 로그가 저장될 디렉토리"
     )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="redundancy-based",
+        help="[redundancy-based, magnitude-based, l0-based, one-shot]"
+    )
     args = parser.parse_args()
 
 
@@ -822,11 +828,11 @@ def main():
         return {"wer": wer}
 
     
-
     # 1) 초기 설정
     init_num_layers = model.config.num_hidden_layers
     init_num_heads = model.config.num_attention_heads
     init_num_total_heads = init_num_layers * init_num_heads
+    init_head_dim = model.config.hidden_size // init_num_heads
     # (전체 헤드 중 (1 - pruning_ratio)만큼을 10회에 걸쳐 제거)
     heads_to_remove_per_step = int( init_num_total_heads * (1 - args.pruning_ratio) / args.total_pruning_iterations )
     print(f"[초기설정] iteration x {args.total_pruning_iterations}, 최종 pruning_ratio={args.pruning_ratio}")
@@ -837,9 +843,13 @@ def main():
 
     init_model = model
     model.config.output_attentions = True  # attention 추출 허용
-    avg_attn_matrices = get_avg_attention_matrices(model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
-    heads_to_keep = find_heads_to_keep(avg_attn_matrices, already_pruned_heads_dict, init_num_total_heads, args) # [(head_idx, avg_similarity), ...]
-    print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들: {heads_to_keep}')
+    
+    if args.method == "redundancy-based":
+        avg_attn_matrices = get_avg_attention_matrices(model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
+        heads_to_keep = find_heads_to_keep(avg_attn_matrices, already_pruned_heads_dict, init_num_total_heads, args) # [(head_idx, avg_similarity), ...]
+        print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들: {heads_to_keep}')
+    else:
+        heads_to_keep = []
 
     # heads_to_keep에 들어있는 head들 already_pruned_heads_dict에 추가
 
@@ -871,7 +881,6 @@ def main():
             per_device_train_batch_size=args.per_device_train_batch_size,
             evaluation_strategy="epoch",
             save_strategy="epoch",
-            logging_steps=10,
             learning_rate=1e-4,
             fp16=True,  # GPU 사용 시
             save_total_limit=1,
@@ -900,43 +909,87 @@ def main():
 
         # (다음 iteration에서 다시 attention 뽑을 때를 위해)
         step_i_model.config.output_attentions = True
-        # 3) 헤드 평가용 attention 추출 (랜덤 10샘플)
-        avg_attn_matrices = get_avg_attention_matrices(step_i_model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
-        # avg_attn_matrices: Tensor(init_num_layers, init_num_heads, seq_len, seq_len)
-
-        # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
-        current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
-
-        # 이번 단계에서 제거할 head 수 계산(절대 개수)
-        n_remove = heads_to_remove_per_step
-        # 만약 현재 남은 head 수가 n_remove보다 작으면, 조정
-        if current_num_heads <= n_remove:
-            n_remove = current_num_heads - 1  # 최소 1개는 남김
-
-        # 4) 클러스터링 -> 제거 대상 head 선정
-        print(f'avg_attn_matrices.shape: {avg_attn_matrices.shape}')
-        print(f'n_remove: {n_remove}')
-        remove_candidates = cluster_and_select_heads(avg_attn_matrices, distance_metric=args.distance_metric, n_remove=n_remove, init_num_total_heads=init_num_total_heads, already_pruned_heads=already_pruned_heads_dict, test_mode=args.test_mode, init_num_heads=init_num_heads, heads_to_keep=heads_to_keep)
-        # remove_candidates: [(layer_idx, head_idx_in_layer), ...]
-        print(f''' - 제거할 head 후보: {remove_candidates}''')
         
-        for (lyr_idx, h_idx) in remove_candidates:
-            if h_idx in already_pruned_heads_dict[lyr_idx]:
-                print(f' - 이미 제거된 head 이니 건너뜀: ({lyr_idx}, {h_idx})')
-                continue
-            h_g_idx = lyr_idx * init_num_heads + h_idx
-            if h_g_idx in heads_to_keep:
-                print(f' - 중요하다 판단해서 제거하지 않을 head 이니 건너뜀: ({lyr_idx}, {h_idx})')
-                continue
-            # 이 head까지 pruning하면 해당 layer에 더이상 남는 head가 없다면 skip
-            if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
-                print(f' - 이 head까지 제거하면 더이상 남는 head가 없어서 건너뜀: ({lyr_idx}, {h_idx})')
-                continue
-            heads_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
-            # already_pruned_heads_dict 갱신    
-            already_pruned_heads_dict[lyr_idx].add(h_idx)
+        if args.method == "redundancy-based":
+            # 3) 헤드 평가용 attention 추출 (랜덤 10샘플)
+            avg_attn_matrices = get_avg_attention_matrices(step_i_model, processor, train_dataset, data_collator, sample_size=10, already_pruned_heads=already_pruned_heads_dict)
+            # avg_attn_matrices: Tensor(init_num_layers, init_num_heads, seq_len, seq_len)
+
+            # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
+            current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
+
+            # 이번 단계에서 제거할 head 수 계산(절대 개수)
+            n_remove = heads_to_remove_per_step
+            # 만약 현재 남은 head 수가 n_remove보다 작으면, 조정
+            if current_num_heads <= n_remove:
+                n_remove = current_num_heads - 1  # 최소 1개는 남김
+
+            # 4) 클러스터링 -> 제거 대상 head 선정
+            print(f'avg_attn_matrices.shape: {avg_attn_matrices.shape}')
+            print(f'n_remove: {n_remove}')
+            remove_candidates = cluster_and_select_heads(avg_attn_matrices, distance_metric=args.distance_metric, n_remove=n_remove, init_num_total_heads=init_num_total_heads, already_pruned_heads=already_pruned_heads_dict, test_mode=args.test_mode, init_num_heads=init_num_heads, heads_to_keep=heads_to_keep)
+            # remove_candidates: [(layer_idx, head_idx_in_layer), ...]
+            print(f''' - 제거할 head 후보: {remove_candidates}''')
+            
+            for (lyr_idx, h_idx) in remove_candidates:
+                if h_idx in already_pruned_heads_dict[lyr_idx]:
+                    print(f' - 이미 제거된 head 이니 건너뜀: ({lyr_idx}, {h_idx})')
+                    continue
+                h_g_idx = lyr_idx * init_num_heads + h_idx
+                if h_g_idx in heads_to_keep:
+                    print(f' - 중요하다 판단해서 제거하지 않을 head 이니 건너뜀: ({lyr_idx}, {h_idx})')
+                    continue
+                # 이 head까지 pruning하면 해당 layer에 더이상 남는 head가 없다면 skip
+                if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                    print(f' - 이 head까지 제거하면 더이상 남는 head가 없어서 건너뜀: ({lyr_idx}, {h_idx})')
+                    continue
+                heads_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
+                # already_pruned_heads_dict 갱신    
+                already_pruned_heads_dict[lyr_idx].add(h_idx)
         
-        
+        elif args.method == "magnitude-based":
+            head_importance = []
+            # 1) 각 layer, 각 head에 대해 Q-proj 가중치 L1-norm 계산
+            for layer_idx in range(init_num_layers):
+                # HuggingFace Wav2Vec2 Attention 모듈
+                attn = step_i_model.wav2vec2.encoder.layers[layer_idx].attention
+                q_weight = attn.q_proj.weight.data  # shape: [hidden_size, hidden_size]
+                # TODO: q_weight 만으로 magnitude를 계산해도 돼?
+                for h in range(init_num_heads):
+                    # 이미 제거된 헤드는 스킵
+                    if h in already_pruned_heads_dict[layer_idx]:
+                        continue
+                    start, end = h * init_head_dim, (h + 1) * init_head_dim
+                    # L1-norm 을 중요도로 사용
+                    magnitude = q_weight[start:end, :].abs().sum().item()
+                    head_importance.append((layer_idx, h, magnitude))
+
+            # 2) 중요도 오름차순 정렬
+            head_importance.sort(key=lambda x: x[2])
+
+            # 3) 이번 iteration 에 제거할 헤드 개수 결정
+            current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
+            n_remove = heads_to_remove_per_step
+            # 최소 1개는 남기기
+            if current_num_heads <= n_remove:
+                n_remove = current_num_heads - 1
+
+            # 4) 제거 대상 후보 선택
+            remove_candidates = head_importance[:n_remove]
+            print(f" - magnitude-based 제거할 head 후보: {remove_candidates}")
+
+            # 5) heads_to_prune_dict 및 already_pruned_heads_dict 업데이트
+            for (lyr_idx, h_idx, _) in remove_candidates:
+                # 해당 layer 에 최소 1개는 남도록 보장
+                if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                    print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx})")
+                    continue
+                heads_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
+                already_pruned_heads_dict[lyr_idx].add(h_idx)
+        elif args.method == "l0-based":
+            pass
+        else:
+            raise ValueError(f"Unknown method: {args.method}")
         # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
         current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
         print(f" - 현재 남아있는 전체 헤드 수: {current_num_heads}")
@@ -963,7 +1016,6 @@ def main():
         per_device_train_batch_size=args.per_device_train_batch_size,
         evaluation_strategy="epoch",
         save_strategy="epoch",
-        logging_steps=10,
         learning_rate=1e-4,
         fp16=True,  # GPU 사용 시
         save_total_limit=4,
