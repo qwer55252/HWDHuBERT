@@ -1003,7 +1003,6 @@ def main():
                 heads_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
                 # already_pruned_heads_dict 갱신    
                 already_pruned_heads_dict[lyr_idx].add(h_idx)
-        
         elif args.method == "magnitude-based":
             head_importance = []
             # 1) 각 layer, 각 head에 대해 Q-proj 가중치 L1-norm 계산
@@ -1044,7 +1043,42 @@ def main():
                 heads_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
                 already_pruned_heads_dict[lyr_idx].add(h_idx)
         elif args.method == "l0-based":
-            pass
+            head_importance = []
+            # 1) 각 layer, 각 head에 대해 L0-노름 계산 (비제로 가중치 개수)
+            for layer_idx in range(init_num_layers):
+                attn = step_i_model.wav2vec2.encoder.layers[layer_idx].attention
+                q_weight = attn.q_proj.weight.data  # shape: [hidden_size, hidden_size]
+                for h in range(init_num_heads):
+                    # 이미 제거된 헤드는 건너뜀
+                    if h in already_pruned_heads_dict[layer_idx]:
+                        continue
+                    start, end = h * init_head_dim, (h + 1) * init_head_dim
+                    sub_w = q_weight[start:end, :]        # 해당 head의 Q-proj 가중치 블록
+                    # 비제로 원소 개수 계산
+                    nonzero_count = torch.count_nonzero(sub_w).item()
+                    head_importance.append((layer_idx, h, nonzero_count))
+
+            # 2) 비제로 개수 오름차순(가장 스파스한 헤드 우선) 정렬
+            head_importance.sort(key=lambda x: x[2])
+
+            # 3) 이번 iteration에 제거할 헤드 수 결정
+            current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
+            n_remove = heads_to_remove_per_step
+            if current_num_heads <= n_remove:
+                n_remove = current_num_heads - 1  # 최소 1개는 남기기
+
+            # 4) 제거 대상 후보 선택
+            remove_candidates = head_importance[:n_remove]
+            print(f" - l0-based 제거할 head 후보: {remove_candidates}")
+
+            # 5) heads_to_prune_dict 및 already_pruned_heads_dict 업데이트
+            for (lyr_idx, h_idx, _) in remove_candidates:
+                # 레이어당 최소 1개 헤드는 남도록 보장
+                if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                    print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx})")
+                    continue
+                heads_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
+                already_pruned_heads_dict[lyr_idx].add(h_idx)
         else:
             raise ValueError(f"Unknown method: {args.method}")
         # 현재 남아있는 총 head 수 (already_pruned_heads_dict 로부터 관리)
