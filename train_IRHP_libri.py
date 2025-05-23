@@ -1,10 +1,16 @@
 import re
+import os
+import json
+import glob
 import torch
 import random
 import argparse
+import aiohttp
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.callbacks import ModelCheckpoint
 from tqdm import tqdm
 from copy import deepcopy
 from transformers import Wav2Vec2Config, Wav2Vec2Processor, TrainingArguments, Trainer, Wav2Vec2ForCTC
@@ -16,7 +22,7 @@ from sklearn.metrics import silhouette_score
 from scipy.spatial.distance import cosine
 from scipy.stats import pearsonr
 
-from datasets import load_dataset
+from datasets import load_dataset, DownloadConfig, config
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 from evaluate import load
@@ -714,11 +720,11 @@ def clean_transcript(text):
     text = re.sub(r"\s+", " ", text).strip()         # 중복 공백 정리
     return text
 
-def load_datasets(dataset_name):
+def load_datasets(dataset_name, dl_cfg):
     if dataset_name == "librispeech":
-        train_dataset = load_dataset("openslr/librispeech_asr", "clean", split="train.100", trust_remote_code=True)
-        dev_dataset = load_dataset("openslr/librispeech_asr", "clean", split="validation", trust_remote_code=True)
-        test_dataset = load_dataset("openslr/librispeech_asr", "clean", split="test", trust_remote_code=True)
+        train_dataset = load_dataset("openslr/librispeech_asr", "clean", split="train.100", trust_remote_code=True, download_config=dl_cfg)
+        dev_dataset = load_dataset("openslr/librispeech_asr", "clean", split="validation", trust_remote_code=True, download_config=dl_cfg)
+        test_dataset = load_dataset("openslr/librispeech_asr", "clean", split="test", trust_remote_code=True, download_config=dl_cfg)
     elif dataset_name == "tedlium":
         train_dataset = load_dataset("./tedlium_test.py", "release1", split="train", trust_remote_code=True)
         dev_dataset = load_dataset("./tedlium_test.py", "release1", split="validation", trust_remote_code=True)
@@ -731,6 +737,43 @@ def load_datasets(dataset_name):
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
     return train_dataset, dev_dataset, test_dataset
+
+def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str):
+    """
+    HuggingFace Dataset 객체(ds)를 순회하며
+    NeMo 형식의 JSON manifest를 생성
+    """
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+    # HF가 flac을 풀어놓는 최상위 디렉토리
+    extract_root = os.path.join(cache_dir, "extracted")
+
+    with open(manifest_path, "w") as fout:
+        for sample in ds:
+            audio     = sample["audio"]
+            orig_path = audio["path"]  # HF가 알려준 경로 (존재하지 않을 수도 있음)
+
+            # 1) 첫 시도: orig_path 에 파일이 실제로 존재하는지
+            if not os.path.isfile(orig_path):
+                filename = os.path.basename(orig_path)
+                # 2) fallback: extract_root 이하를 재귀 검색
+                pattern = os.path.join(extract_root, "**", filename)
+                matches = glob.glob(pattern, recursive=True)
+                if not matches:
+                    raise FileNotFoundError(
+                        f"Audio 파일을 찾을 수 없습니다: {filename} \n"
+                        f"원경로: {orig_path}\n"
+                        f"검색경로: {pattern}"
+                    )
+                # 검색 결과 중 첫 번째를 사용
+                orig_path = matches[0]
+
+            duration = len(audio["array"]) / audio["sampling_rate"]
+            entry = {
+                "audio_filepath": orig_path,
+                "duration":        duration,
+                "text":            sample["text"].lower().strip(),
+            }
+            fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 def main():
     # -------------------- #
@@ -802,50 +845,133 @@ def main():
         default="librispeech",
         help="[librispeech, tedlium]"
     )
+    parser.add_argument(
+        "--data_script_path",
+        type=str,
+        default="./librispeech_asr.py",
+        help="HuggingFace LibriSpeech 데이터 스크립트 경로",
+    )
+    parser.add_argument(
+        "--data_config_name",
+        type=str,
+        default="train_100",
+        help="_DL_URLS 키값 설정(train_100 등)",
+    )
+    parser.add_argument("--data_dir", type=str, default="data", help="데이터 루트 디렉토리")
+    parser.add_argument(
+        "--data_train_split",
+        type=str,
+        default="train.clean.100",
+        help="훈련 split 이름",
+    )
+    parser.add_argument(
+        "--data_val_split",
+        type=str,
+        default="dev.clean",
+        help="평가 split 이름",
+    )
+    parser.add_argument(
+        "--data_test_split",
+        type=str,
+        default="test.clean",
+        help="평가 split 이름",
+    )
     args = parser.parse_args()
+    
+    ### Stage 1. 데이터셋 준비
+    # LibriSpeech ASR 데이터셋 로드 (train-clean-100 및 validation-clean)
+    # manifest 경로 설정
+    os.makedirs(args.output_dir, exist_ok=True)
+    manifest_dir = os.path.join(args.data_dir, "manifests")
+    os.makedirs(manifest_dir, exist_ok=True)
+    train_manifest = os.path.join(manifest_dir, "train.json")
+    val_manifest = os.path.join(manifest_dir, "val.json")
+    test_manifest = os.path.join(manifest_dir, "test.json")
 
+    # 1) HuggingFace LibriSpeech 로드
+    print("Datasets cache dir:", config.HF_DATASETS_CACHE)
+    
+    cache_dir = os.path.join(args.data_dir, "cache")
+    config.HF_DATASETS_CACHE = cache_dir
+    dl_cfg = DownloadConfig(
+        cache_dir=cache_dir,
+        force_download=False,
+        resume_download=True,
+        max_retries=10,
+        disable_tqdm=False,
+        download_desc="Downloading LibriSpeech ASR",
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+        delete_extracted=False,
+        extract_compressed_file=True,
+        force_extract=True,            
+    )
+    
+    train_dataset = load_dataset(
+        args.data_script_path,
+        args.data_config_name,
+        split=args.data_train_split,
+        trust_remote_code=True,
+        download_config=dl_cfg,
+        cache_dir=cache_dir,
+    )
+    val_dataset = load_dataset(
+        args.data_script_path,
+        args.data_config_name,
+        split=args.data_val_split,
+        trust_remote_code=True,
+        download_config=dl_cfg,
+        cache_dir=cache_dir,
+    )
+    test_dataset = load_dataset(
+        args.data_script_path,
+        args.data_config_name,
+        split=args.data_test_split,
+        trust_remote_code=True,
+        download_config=dl_cfg,
+        cache_dir=cache_dir,
+    )
+    print(f'train_dataset.cache_files: {train_dataset.cache_files}')  # [{'filename': '/home/you/.cache/huggingface/datasets/.../train.arrow', ...}, ...]
+    eval_datasets = {"dev": test_dataset, "test": test_dataset}
 
-    config = Wav2Vec2Config.from_pretrained(args.model_name_or_path, output_attentions=True)
-    processor = Wav2Vec2Processor.from_pretrained(args.model_name_or_path, config=config)
+    # NeMo manifest 생성
+    print("building manifest files...")
+    if not os.path.isfile(train_manifest):
+        build_manifest_from_hf(train_dataset, train_manifest, cache_dir)
+        print(f"train_manifest DONE: {train_manifest}")
+    if not os.path.isfile(val_manifest):
+        build_manifest_from_hf(val_dataset, val_manifest, cache_dir)
+        print(f"val_manifest DONE: {val_manifest}")
+    if not os.path.isfile(test_manifest):
+        build_manifest_from_hf(test_dataset, test_manifest, cache_dir)
+        print(f"test_manifest DONE: {test_manifest}")
+    print("manifest files built.")
+    # 3) W&B logger 생성
+    exp_name = os.getenv("EXP_NAME")
+    wandb_logger = WandbLogger(project=exp_name, save_dir=args.output_dir)
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=args.output_dir,
+        filename="best",
+        save_top_k=1,
+        verbose=True,
+        monitor="val_loss",
+        mode="min",
+    )
+    
+
+    ### Stage 2. 모델 준비
+    wav2vec2config = Wav2Vec2Config.from_pretrained(args.model_name_or_path, output_attentions=True)
+    processor = Wav2Vec2Processor.from_pretrained(args.model_name_or_path, config=wav2vec2config)
     model = Wav2Vec2ForCTC.from_pretrained(
         args.model_name_or_path, 
         output_attentions=True,
         ctc_loss_reduction="mean", 
         pad_token_id=processor.tokenizer.pad_token_id,
     )
-
-    print(f'config: {config}')
-
-
-    ### Stage 2. 데이터셋 준비
-    # LibriSpeech ASR 데이터셋 로드 (train-clean-100 및 validation-clean)
-    train_dataset, dev_dataset, test_dataset = load_datasets(args.dataset)
-    if args.test_mode: # 100개 데이터만 사용
-        train_dataset = train_dataset.select(range(100))
-        dev_dataset = dev_dataset.select(range(100))
-        test_dataset = test_dataset.select(range(100))
-        
-    # 필요한 경우 전처리
-    train_dataset = train_dataset.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
-    dev_dataset = dev_dataset.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
-    test_dataset = test_dataset.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
-    
-    # (4) 샘플 내부 구조와 일부 값 확인
-    for split, ds in (("train", train_dataset), ("dev", dev_dataset), ("test", test_dataset)):
-        sample = ds[0]
-        print(f"\n--- {split} sample #0 ---")
-        print("input_values:", sample["input_values"][:10], "… (len:", len(sample["input_values"]), ")")
-        print("labels:", sample["labels"][:10], "…")
-    print(train_dataset)
-    print(dev_dataset)
-    print(test_dataset)
-    eval_datasets = {"dev": dev_dataset, "test": test_dataset} # TODO: 정상작동하는지 확인
-    # eval_datasets = test_dataset
     data_collator = DataCollatorCTCWithPadding(processor=processor, padding=True)
+    
 
     ### Stage 3. Iterative Head Pruning 수행
     model.config.output_attentions = False # Pruning 후에는 attention 출력 끔
-    
     
     def compute_metrics(pred):
         pred_logits = pred.predictions
@@ -884,7 +1010,6 @@ def main():
         # print(f'label_str: {label_str}')
         return {"wer": wer}
 
-    
     # 1) 초기 설정
     init_num_layers = model.config.num_hidden_layers
     init_num_heads = model.config.num_attention_heads
@@ -1130,8 +1255,79 @@ def main():
 
     # 최종 fine-tuning 실행
     trainer_2.train()
+    # 9) Best checkpoint 로드 후 .nemo로 저장
+    best_ckpt = checkpoint_callback.best_model_path
+    os.makedirs(f"{args.output_dir}/{exp_name}", exist_ok=True)
+    model.save_to(f"{args.output_dir}/{exp_name}/result_weight_{exp_name}.nemo")
+    print(f"Saved .nemo to {args.output_dir}/{exp_name}")
 
     print("\n[모든 작업 완료]")
+    
+    # 10) 평가 시작
+    split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
+    metrics = {}
+    
+    checkpoint_callback = ModelCheckpoint(
+        dirpath=args.output_dir,
+        filename="best",
+        save_top_k=1,
+        verbose=True,
+        monitor="val_loss",
+        mode="min",
+    )
+    
+    for i, split_name in enumerate(split_names):
+        print(f"\n===== Evaluating on split: {split_name} =====")
+        model.eval()
+
+        test_i_ds = load_dataset(
+            args.data_script_path,
+            args.data_config_name,
+            split=split_name,
+            trust_remote_code=True,
+            download_config=dl_cfg,
+        )
+        json_name = split_name.replace(".", "_") + ".json"
+        manifest_i = os.path.join(manifest_dir, json_name)
+        build_manifest_from_hf(test_i_ds, manifest_i, cache_dir)
+
+        test_data_config = deepcopy(model.cfg.test_dataset)
+        test_data_config.manifest_filepath = manifest_i
+        # shuffle 옵션이 없으면 False 로 자동 설정되지만, 명시적으로 꺼줄 수도 있습니다.
+        test_data_config.shuffle = False
+
+        # NeMo API 호출: 내부에서 _test_dl 이 세팅되고,
+        # 이후 test_dataloader() 호출 시 이 _test_dl 이 반환됩니다.
+        model.setup_test_data(test_data_config)
+        dl = model.test_dataloader()
+        
+        
+        results = trainer_2.test(
+            model=model,
+            dataloaders=[dl],
+            ckpt_path=best_ckpt or None,
+            verbose=True,
+        )
+        
+        # trainer.test 는 리스트(dict) 반환, 첫 번째 원소에서 메트릭 추출
+        res   = results[0]
+        wer   = res.get("test_wer", res.get("wer", None))
+        loss  = res.get("test_loss", res.get("loss", None))
+        print(f"  → split={split_name} | loss={loss:.4f} | wer={wer:.2%}")
+        
+        # ① 메트릭 키에 split 이름을 붙여서 Wandb에 기록
+        # #    dev.clean  → dev_clean/wer, dev_clean/loss
+        key_prefix = split_name.replace(".", "_")
+        metric = {
+            f"{key_prefix}/wer":  wer,
+            f"{key_prefix}/loss": loss,
+        }
+        metrics[f"{key_prefix}/wer"] = wer
+        metrics[f"{key_prefix}/loss"] = loss
+        # ② step을 epoch 기반으로 찍거나 global_step 을 사용
+        wandb_logger.log_metrics(metric, step=trainer_2.current_epoch)
+    print(f"metrics: {metrics}")
+    wandb_logger.log_metrics(metrics, step=trainer_2.current_epoch)
     
 if __name__ == "__main__":
     main()
