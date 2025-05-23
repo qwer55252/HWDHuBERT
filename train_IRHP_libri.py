@@ -855,7 +855,7 @@ def main():
         "--data_config_name",
         type=str,
         default="train_100",
-        help="_DL_URLS 키값 설정(train_100 등)",
+        help="_DL_URLS 키값 설정(train_100 등) [train_100, train_460, for_experiments]",
     )
     parser.add_argument("--data_dir", type=str, default="data", help="데이터 루트 디렉토리")
     parser.add_argument(
@@ -930,21 +930,28 @@ def main():
         download_config=dl_cfg,
         cache_dir=cache_dir,
     )
+    if args.test_mode: # 100개 데이터만 사용
+        train_dataset = train_dataset.select(range(100))
+        val_dataset = val_dataset.select(range(100))
+        test_dataset = test_dataset.select(range(100))
+        args.iterative_finetune_epochs = 1
+        args.final_finetune_epochs = 5
+    
     print(f'train_dataset.cache_files: {train_dataset.cache_files}')  # [{'filename': '/home/you/.cache/huggingface/datasets/.../train.arrow', ...}, ...]
-    eval_datasets = {"dev": test_dataset, "test": test_dataset}
+    eval_datasets = {"dev": val_dataset, "test": test_dataset}
 
     # NeMo manifest 생성
-    print("building manifest files...")
-    if not os.path.isfile(train_manifest):
-        build_manifest_from_hf(train_dataset, train_manifest, cache_dir)
-        print(f"train_manifest DONE: {train_manifest}")
-    if not os.path.isfile(val_manifest):
-        build_manifest_from_hf(val_dataset, val_manifest, cache_dir)
-        print(f"val_manifest DONE: {val_manifest}")
-    if not os.path.isfile(test_manifest):
-        build_manifest_from_hf(test_dataset, test_manifest, cache_dir)
-        print(f"test_manifest DONE: {test_manifest}")
-    print("manifest files built.")
+    # print("building manifest files...")
+    # if not os.path.isfile(train_manifest):
+    #     build_manifest_from_hf(train_dataset, train_manifest, cache_dir)
+    #     print(f"train_manifest DONE: {train_manifest}")
+    # if not os.path.isfile(val_manifest):
+    #     build_manifest_from_hf(val_dataset, val_manifest, cache_dir)
+    #     print(f"val_manifest DONE: {val_manifest}")
+    # if not os.path.isfile(test_manifest):
+    #     build_manifest_from_hf(test_dataset, test_manifest, cache_dir)
+    #     print(f"test_manifest DONE: {test_manifest}")
+    # print("manifest files built.")
     # 3) W&B logger 생성
     exp_name = os.getenv("EXP_NAME")
     wandb_logger = WandbLogger(project=exp_name, save_dir=args.output_dir)
@@ -1135,6 +1142,9 @@ def main():
                 # HuggingFace Wav2Vec2 Attention 모듈
                 attn = step_i_model.wav2vec2.encoder.layers[layer_idx].attention
                 q_weight = attn.q_proj.weight.data  # shape: [hidden_size, hidden_size]
+                k_weight = attn.k_proj.weight.data
+                v_weight = attn.v_proj.weight.data
+                o_weight = attn.out_proj.weight.data
                 # TODO: q_weight 만으로 magnitude를 계산해도 돼?
                 for h in range(init_num_heads):
                     # 이미 제거된 헤드는 스킵
@@ -1142,7 +1152,15 @@ def main():
                         continue
                     start, end = h * init_head_dim, (h + 1) * init_head_dim
                     # L1-norm 을 중요도로 사용
-                    magnitude = q_weight[start:end, :].abs().sum().item()
+                    q_norm = q_weight[start:end, :].abs().sum()
+                    k_norm = k_weight[start:end, :].abs().sum()
+                    v_norm = v_weight[start:end, :].abs().sum()
+
+                    # Output projection: column block
+                    o_norm = o_weight[:, start:end].abs().sum()
+
+                    # 네 개 블록 합산하여 magnitude로 사용
+                    magnitude = (q_norm + k_norm + v_norm + o_norm).item()
                     head_importance.append((layer_idx, h, magnitude))
 
             # 2) 중요도 오름차순 정렬
@@ -1169,21 +1187,33 @@ def main():
                 already_pruned_heads_dict[lyr_idx].add(h_idx)
         elif args.method == "l0-based":
             head_importance = []
-            # 1) 각 layer, 각 head에 대해 L0-노름 계산 (비제로 가중치 개수)
+            # 1) 각 layer, 각 head에 대해 Q/K/V/O-proj 가중치 L0-노름 계산
             for layer_idx in range(init_num_layers):
                 attn = step_i_model.wav2vec2.encoder.layers[layer_idx].attention
-                q_weight = attn.q_proj.weight.data  # shape: [hidden_size, hidden_size]
+                q_weight = attn.q_proj.weight.data   # [hidden, hidden]
+                k_weight = attn.k_proj.weight.data
+                v_weight = attn.v_proj.weight.data
+                o_weight = attn.out_proj.weight.data
                 for h in range(init_num_heads):
-                    # 이미 제거된 헤드는 건너뜀
                     if h in already_pruned_heads_dict[layer_idx]:
                         continue
                     start, end = h * init_head_dim, (h + 1) * init_head_dim
-                    sub_w = q_weight[start:end, :]        # 해당 head의 Q-proj 가중치 블록
-                    # 비제로 원소 개수 계산
-                    nonzero_count = torch.count_nonzero(sub_w).item()
-                    head_importance.append((layer_idx, h, nonzero_count))
 
-            # 2) 비제로 개수 오름차순(가장 스파스한 헤드 우선) 정렬
+                    # 각 블록에서 비제로 원소 개수 계산
+                    sub_q = q_weight[start:end, :]
+                    sub_k = k_weight[start:end, :]
+                    sub_v = v_weight[start:end, :]
+                    sub_o = o_weight[:, start:end]
+
+                    nonzero_q = torch.count_nonzero(sub_q)
+                    nonzero_k = torch.count_nonzero(sub_k)
+                    nonzero_v = torch.count_nonzero(sub_v)
+                    nonzero_o = torch.count_nonzero(sub_o)
+
+                    total_nonzero = (nonzero_q + nonzero_k + nonzero_v + nonzero_o).item()
+                    head_importance.append((layer_idx, h, total_nonzero))
+
+            # 2) 비제로 개수 오름차순 정렬 (가장 스파스한 헤드 우선)
             head_importance.sort(key=lambda x: x[2])
 
             # 3) 이번 iteration에 제거할 헤드 수 결정
@@ -1198,7 +1228,6 @@ def main():
 
             # 5) heads_to_prune_dict 및 already_pruned_heads_dict 업데이트
             for (lyr_idx, h_idx, _) in remove_candidates:
-                # 레이어당 최소 1개 헤드는 남도록 보장
                 if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
                     print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx})")
                     continue
@@ -1255,14 +1284,12 @@ def main():
 
     # 최종 fine-tuning 실행
     trainer_2.train()
-    # 9) Best checkpoint 로드 후 .nemo로 저장
-    best_ckpt = checkpoint_callback.best_model_path
-    os.makedirs(f"{args.output_dir}/{exp_name}", exist_ok=True)
-    model.save_to(f"{args.output_dir}/{exp_name}/result_weight_{exp_name}.nemo")
-    print(f"Saved .nemo to {args.output_dir}/{exp_name}")
 
     print("\n[모든 작업 완료]")
     
+    # 9) Best checkpoint 로드 후 .nemo로 저장
+    best_ckpt = checkpoint_callback.best_model_path
+    os.makedirs(f"{args.output_dir}/{exp_name}", exist_ok=True)
     # 10) 평가 시작
     split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
     metrics = {}
@@ -1278,7 +1305,7 @@ def main():
     
     for i, split_name in enumerate(split_names):
         print(f"\n===== Evaluating on split: {split_name} =====")
-        model.eval()
+        final_finetune_model.eval()
 
         test_i_ds = load_dataset(
             args.data_script_path,
@@ -1287,32 +1314,14 @@ def main():
             trust_remote_code=True,
             download_config=dl_cfg,
         )
-        json_name = split_name.replace(".", "_") + ".json"
-        manifest_i = os.path.join(manifest_dir, json_name)
-        build_manifest_from_hf(test_i_ds, manifest_i, cache_dir)
-
-        test_data_config = deepcopy(model.cfg.test_dataset)
-        test_data_config.manifest_filepath = manifest_i
-        # shuffle 옵션이 없으면 False 로 자동 설정되지만, 명시적으로 꺼줄 수도 있습니다.
-        test_data_config.shuffle = False
-
-        # NeMo API 호출: 내부에서 _test_dl 이 세팅되고,
-        # 이후 test_dataloader() 호출 시 이 _test_dl 이 반환됩니다.
-        model.setup_test_data(test_data_config)
-        dl = model.test_dataloader()
         
-        
-        results = trainer_2.test(
-            model=model,
-            dataloaders=[dl],
-            ckpt_path=best_ckpt or None,
-            verbose=True,
+        matrics_i = trainer_2.evaluate(
+            eval_dataset=test_i_ds
         )
         
         # trainer.test 는 리스트(dict) 반환, 첫 번째 원소에서 메트릭 추출
-        res   = results[0]
-        wer   = res.get("test_wer", res.get("wer", None))
-        loss  = res.get("test_loss", res.get("loss", None))
+        wer = matrics_i["eval_wer"]
+        loss = matrics_i["eval_loss"]
         print(f"  → split={split_name} | loss={loss:.4f} | wer={wer:.2%}")
         
         # ① 메트릭 키에 split 이름을 붙여서 Wandb에 기록
@@ -1325,9 +1334,9 @@ def main():
         metrics[f"{key_prefix}/wer"] = wer
         metrics[f"{key_prefix}/loss"] = loss
         # ② step을 epoch 기반으로 찍거나 global_step 을 사용
-        wandb_logger.log_metrics(metric, step=trainer_2.current_epoch)
+        wandb_logger.log_metrics(metric, step=trainer_2.state.global_step)
     print(f"metrics: {metrics}")
-    wandb_logger.log_metrics(metrics, step=trainer_2.current_epoch)
+    wandb_logger.log_metrics(metrics, step=trainer_2.state.global_step)
     
 if __name__ == "__main__":
     main()

@@ -51,6 +51,14 @@ _DL_URLS = {
         "dev.clean": _DL_URL + "dev-clean.tar.gz",
         "dev.other": _DL_URL + "dev-other.tar.gz",
     },
+    "train_460": {
+        "train.clean.100": _DL_URL + "train-clean-100.tar.gz",
+        "train.clean.360": _DL_URL + "train-clean-360.tar.gz",
+        "test.clean": _DL_URL + "test-clean.tar.gz",
+        "test.other": _DL_URL + "test-other.tar.gz",
+        "dev.clean": _DL_URL + "dev-clean.tar.gz",
+        "dev.other": _DL_URL + "dev-other.tar.gz",
+    },
     "for_experiments": {
         "dev.clean": _DL_URL + "dev-clean.tar.gz",
         "test.clean": _DL_URL + "test-clean.tar.gz",
@@ -101,6 +109,7 @@ class LibrispeechASR(datasets.GeneratorBasedBuilder):
     DEFAULT_CONFIG_NAME = "all"
     BUILDER_CONFIGS = [
         LibrispeechASRConfig(name="train_100", description="'train_100 + dev_clean + dev_other + test_clean + test_other' speech."),
+        LibrispeechASRConfig(name="train_460", description="'train_100 + train_360 + dev_clean + dev_other + test_clean + test_other' speech."),
         LibrispeechASRConfig(name="for_experiments", description="train_100 기다리기 싫어서 하나 만듦"),
         LibrispeechASRConfig(name="clean", description="'Clean' speech."),
         LibrispeechASRConfig(name="other", description="'Other', more challenging, speech."),
@@ -137,6 +146,55 @@ class LibrispeechASR(datasets.GeneratorBasedBuilder):
                     gen_kwargs={
                         "local_extracted_archive": local_extracted_archive.get("train.clean.100"),
                         "files": dl_manager.iter_archive(archive_path["train.clean.100"]),
+                    },
+                ),
+            ]
+            dev_splits = [
+                datasets.SplitGenerator(
+                    name="dev.clean",
+                    gen_kwargs={
+                        "local_extracted_archive": local_extracted_archive.get("dev.clean"),
+                        "files": dl_manager.iter_archive(archive_path["dev.clean"]),
+                    },
+                ),
+                datasets.SplitGenerator(
+                    name="dev.other",
+                    gen_kwargs={
+                        "local_extracted_archive": local_extracted_archive.get("dev.other"),
+                        "files": dl_manager.iter_archive(archive_path["dev.other"]),
+                    },
+                ),
+            ]
+            test_splits = [
+                datasets.SplitGenerator(
+                    name="test.clean",
+                    gen_kwargs={
+                        "local_extracted_archive": local_extracted_archive.get("test.clean"),
+                        "files": dl_manager.iter_archive(archive_path["test.clean"]),
+                    },
+                ),
+                datasets.SplitGenerator(
+                    name="test.other",
+                    gen_kwargs={
+                        "local_extracted_archive": local_extracted_archive.get("test.other"),
+                        "files": dl_manager.iter_archive(archive_path["test.other"]),
+                    },
+                ),
+            ]
+        if self.config.name == "train_460":
+            train_splits = [
+                datasets.SplitGenerator(
+                    name="train.clean.100",
+                    gen_kwargs={
+                        "local_extracted_archive": local_extracted_archive.get("train.clean.100"),
+                        "files": dl_manager.iter_archive(archive_path["train.clean.100"]),
+                    },
+                ),
+                datasets.SplitGenerator(
+                    name="train.clean.360",
+                    gen_kwargs={
+                        "local_extracted_archive": local_extracted_archive.get("train.clean.360"),
+                        "files": dl_manager.iter_archive(archive_path["train.clean.360"]),
                     },
                 ),
             ]
