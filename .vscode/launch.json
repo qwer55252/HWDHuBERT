@@ -8,13 +8,14 @@
             "name": "Python: train IRHP TEDLIUM",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/train_IRHP_tedlium.py",
+            "program": "${workspaceFolder}/train_IRHP_libri.py",
             "console": "integratedTerminal",
             "args": [
                 "--per_device_train_batch_size", "4",
-                "--output_dir", "outputs/tedlium",
-                "--method", "redundancy-based",
-                "--dataset", "tedlium",
+                "--output_dir", "outputs/libri460_l0based_testmode",
+                "--method", "l0-based",
+                "--dataset", "librispeech",
+                "--data_config_name", "train_460",
                 "--test_mode"
             ],
             "env": {

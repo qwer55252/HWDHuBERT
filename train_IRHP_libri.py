@@ -900,7 +900,7 @@ def main():
         max_retries=10,
         disable_tqdm=False,
         download_desc="Downloading LibriSpeech ASR",
-        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=7200)}},
         delete_extracted=False,
         extract_compressed_file=True,
         force_extract=True,            
@@ -1178,14 +1178,18 @@ def main():
             print(f" - magnitude-based 제거할 head 후보: {remove_candidates}")
 
             # 5) heads_to_prune_dict 및 already_pruned_heads_dict 업데이트
+            cnt = 0
             for (lyr_idx, h_idx, _) in remove_candidates:
                 # 해당 layer 에 최소 1개는 남도록 보장
-                if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
-                    print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx})")
-                    continue
+                while len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                    print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx}) 대신 다른 head로 대체")
+                    lyr_idx, h_idx, _ = head_importance[n_remove + cnt]
+                    cnt += 1
+                print(f" - 최종 remove head: ({lyr_idx}, {h_idx})")
                 heads_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
                 already_pruned_heads_dict[lyr_idx].add(h_idx)
         elif args.method == "l0-based":
+            eps = 1e-3
             head_importance = []
             # 1) 각 layer, 각 head에 대해 Q/K/V/O-proj 가중치 L0-노름 계산
             for layer_idx in range(init_num_layers):
@@ -1205,10 +1209,15 @@ def main():
                     sub_v = v_weight[start:end, :]
                     sub_o = o_weight[:, start:end]
 
-                    nonzero_q = torch.count_nonzero(sub_q)
-                    nonzero_k = torch.count_nonzero(sub_k)
-                    nonzero_v = torch.count_nonzero(sub_v)
-                    nonzero_o = torch.count_nonzero(sub_o)
+                    # nonzero_q = torch.count_nonzero(sub_q)
+                    # nonzero_k = torch.count_nonzero(sub_k)
+                    # nonzero_v = torch.count_nonzero(sub_v)
+                    # nonzero_o = torch.count_nonzero(sub_o)
+                    
+                    nonzero_q = torch.count_nonzero(sub_q.abs() > eps)
+                    nonzero_k = torch.count_nonzero(sub_k.abs() > eps)
+                    nonzero_v = torch.count_nonzero(sub_v.abs() > eps)
+                    nonzero_o = torch.count_nonzero(sub_o.abs() > eps)
 
                     total_nonzero = (nonzero_q + nonzero_k + nonzero_v + nonzero_o).item()
                     head_importance.append((layer_idx, h, total_nonzero))
@@ -1227,10 +1236,13 @@ def main():
             print(f" - l0-based 제거할 head 후보: {remove_candidates}")
 
             # 5) heads_to_prune_dict 및 already_pruned_heads_dict 업데이트
+            cnt = 0
             for (lyr_idx, h_idx, _) in remove_candidates:
-                if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
-                    print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx})")
-                    continue
+                while len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                    print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx}) 대신 다른 head로 대체")
+                    lyr_idx, h_idx, _ = head_importance[n_remove + cnt]
+                    cnt += 1
+                print(f" - 최종 remove head: ({lyr_idx}, {h_idx})")
                 heads_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
                 already_pruned_heads_dict[lyr_idx].add(h_idx)
         else:
