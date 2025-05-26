@@ -5,4 +5,5 @@ CUDA_VISIBLE_DEVICES=2 python train_IRHP_libri.py \
 --output_dir outputs/$EXP_NAME \
 --method "magnitude-based" \
 --dataset "librispeech" \
---data_config_name "train_460"
+--data_config_name "train_460" \
+--data_train_split "train.clean.100+train.clean.360" \
