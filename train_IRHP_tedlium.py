@@ -1010,6 +1010,9 @@ def main():
                 # HuggingFace Wav2Vec2 Attention 모듈
                 attn = step_i_model.wav2vec2.encoder.layers[layer_idx].attention
                 q_weight = attn.q_proj.weight.data  # shape: [hidden_size, hidden_size]
+                k_weight = attn.k_proj.weight.data
+                v_weight = attn.v_proj.weight.data
+                o_weight = attn.out_proj.weight.data
                 # TODO: q_weight 만으로 magnitude를 계산해도 돼?
                 for h in range(init_num_heads):
                     # 이미 제거된 헤드는 스킵
@@ -1017,7 +1020,15 @@ def main():
                         continue
                     start, end = h * init_head_dim, (h + 1) * init_head_dim
                     # L1-norm 을 중요도로 사용
-                    magnitude = q_weight[start:end, :].abs().sum().item()
+                    q_norm = q_weight[start:end, :].abs().sum()
+                    k_norm = k_weight[start:end, :].abs().sum()
+                    v_norm = v_weight[start:end, :].abs().sum()
+
+                    # Output projection: column block
+                    o_norm = o_weight[:, start:end].abs().sum()
+
+                    # 네 개 블록 합산하여 magnitude로 사용
+                    magnitude = (q_norm + k_norm + v_norm + o_norm).item()
                     head_importance.append((layer_idx, h, magnitude))
 
             # 2) 중요도 오름차순 정렬
@@ -1035,30 +1046,51 @@ def main():
             print(f" - magnitude-based 제거할 head 후보: {remove_candidates}")
 
             # 5) heads_to_prune_dict 및 already_pruned_heads_dict 업데이트
+            cnt = 0
             for (lyr_idx, h_idx, _) in remove_candidates:
                 # 해당 layer 에 최소 1개는 남도록 보장
-                if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
-                    print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx})")
-                    continue
+                while len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                    print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx}) 대신 다른 head로 대체")
+                    lyr_idx, h_idx, _ = head_importance[n_remove + cnt]
+                    cnt += 1
+                print(f" - 최종 remove head: ({lyr_idx}, {h_idx})")
                 heads_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
                 already_pruned_heads_dict[lyr_idx].add(h_idx)
         elif args.method == "l0-based":
+            eps = 1e-3
             head_importance = []
-            # 1) 각 layer, 각 head에 대해 L0-노름 계산 (비제로 가중치 개수)
+            # 1) 각 layer, 각 head에 대해 Q/K/V/O-proj 가중치 L0-노름 계산
             for layer_idx in range(init_num_layers):
                 attn = step_i_model.wav2vec2.encoder.layers[layer_idx].attention
-                q_weight = attn.q_proj.weight.data  # shape: [hidden_size, hidden_size]
+                q_weight = attn.q_proj.weight.data   # [hidden, hidden]
+                k_weight = attn.k_proj.weight.data
+                v_weight = attn.v_proj.weight.data
+                o_weight = attn.out_proj.weight.data
                 for h in range(init_num_heads):
-                    # 이미 제거된 헤드는 건너뜀
                     if h in already_pruned_heads_dict[layer_idx]:
                         continue
                     start, end = h * init_head_dim, (h + 1) * init_head_dim
-                    sub_w = q_weight[start:end, :]        # 해당 head의 Q-proj 가중치 블록
-                    # 비제로 원소 개수 계산
-                    nonzero_count = torch.count_nonzero(sub_w).item()
-                    head_importance.append((layer_idx, h, nonzero_count))
 
-            # 2) 비제로 개수 오름차순(가장 스파스한 헤드 우선) 정렬
+                    # 각 블록에서 비제로 원소 개수 계산
+                    sub_q = q_weight[start:end, :]
+                    sub_k = k_weight[start:end, :]
+                    sub_v = v_weight[start:end, :]
+                    sub_o = o_weight[:, start:end]
+
+                    # nonzero_q = torch.count_nonzero(sub_q)
+                    # nonzero_k = torch.count_nonzero(sub_k)
+                    # nonzero_v = torch.count_nonzero(sub_v)
+                    # nonzero_o = torch.count_nonzero(sub_o)
+                    
+                    nonzero_q = torch.count_nonzero(sub_q.abs() > eps)
+                    nonzero_k = torch.count_nonzero(sub_k.abs() > eps)
+                    nonzero_v = torch.count_nonzero(sub_v.abs() > eps)
+                    nonzero_o = torch.count_nonzero(sub_o.abs() > eps)
+
+                    total_nonzero = (nonzero_q + nonzero_k + nonzero_v + nonzero_o).item()
+                    head_importance.append((layer_idx, h, total_nonzero))
+
+            # 2) 비제로 개수 오름차순 정렬 (가장 스파스한 헤드 우선)
             head_importance.sort(key=lambda x: x[2])
 
             # 3) 이번 iteration에 제거할 헤드 수 결정
@@ -1072,11 +1104,13 @@ def main():
             print(f" - l0-based 제거할 head 후보: {remove_candidates}")
 
             # 5) heads_to_prune_dict 및 already_pruned_heads_dict 업데이트
+            cnt = 0
             for (lyr_idx, h_idx, _) in remove_candidates:
-                # 레이어당 최소 1개 헤드는 남도록 보장
-                if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
-                    print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx})")
-                    continue
+                while len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                    print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx}) 대신 다른 head로 대체")
+                    lyr_idx, h_idx, _ = head_importance[n_remove + cnt]
+                    cnt += 1
+                print(f" - 최종 remove head: ({lyr_idx}, {h_idx})")
                 heads_to_prune_dict.setdefault(lyr_idx, []).append(h_idx)
                 already_pruned_heads_dict[lyr_idx].add(h_idx)
         else:
