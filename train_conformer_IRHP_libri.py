@@ -393,6 +393,12 @@ def main():
         default=10,
         help="Iterative Pruning 반복 횟수"
     )
+    parser.add_argument(
+        "--distance_metric",
+        type=str,
+        default="cosine",
+        help="token-based distance 지표('cosine', 'corr', 'js', 'bc') 또는 sentence-based('dCor', 'PC', 'CC') 중 선택"
+    )
     args = parser.parse_args()
 
     # manifest 경로 설정
