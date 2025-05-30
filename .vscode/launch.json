@@ -1,26 +1,63 @@
+// .vscode/launch.json
 {
-    // IntelliSense를 사용하여 가능한 특성에 대해 알아보세요.
-    // 기존 특성에 대한 설명을 보려면 가리킵니다.
-    // 자세한 내용을 보려면 https://go.microsoft.com/fwlink/?linkid=830387을(를) 방문하세요.
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "Python: train IRHP TEDLIUM",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/train_IRHP_libri.py",
-            "console": "integratedTerminal",
-            "args": [
-                "--per_device_train_batch_size", "4",
-                "--output_dir", "outputs/libri460_l0based_testmode",
-                "--method", "l0-based",
-                "--dataset", "librispeech",
-                "--data_config_name", "train_460",
-                "--test_mode"
-            ],
-            "env": {
-                "CUDA_VISIBLE_DEVICES": "2"
-            }
-        }
-    ]
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Conformer Training",
+      "type": "debugpy",
+      "request": "launch",
+      // 학습 스크립트 경로
+      "program": "${workspaceFolder}/train_conformer_IRHP_libri.py",
+      // 터미널에서 입력받은 것처럼 args 전달
+      "args": [
+        "--output_dir", "${workspaceFolder}/outputs/conformer_libri100_IRHP_testmode",
+        "--data_config_name", "train_100",
+        "--data_train_split", "train.clean.100",
+        "--data_val_split", "dev.clean",
+        "--data_test_split", "test.clean",
+        "--batch_size", "32",
+        "--epochs", "10",
+        "--method", "redundancy-based",
+        "--prune_ratio", "0.5",
+        "--test_mode"
+      ],
+      // 환경변수 설정
+      "env": {
+        "HF_DATASETS_CACHE": "/root/.cache/huggingface/datasets",
+        "EXP_NAME": "conformer_libri100_baseline_test"
+      },
+      // 콘솔 출력을 VSCode 통합 터미널에
+      "console": "integratedTerminal",
+      // 작업 디렉토리
+      "cwd": "${workspaceFolder}"
+    },
+    // {
+    //   "name": "Debug Conformer Training",
+    //   "type": "debugpy",
+    //   "request": "launch",
+    //   // 학습 스크립트 경로
+    //   "program": "${workspaceFolder}/train_conformer_baseline_libri.py",
+    //   // 터미널에서 입력받은 것처럼 args 전달
+    //   "args": [
+    //     "--output_dir", "${workspaceFolder}/outputs/conformer_libri100_baseline_testmode",
+    //     "--data_config_name", "train_100",
+    //     "--data_train_split", "train.clean.100",
+    //     "--data_val_split", "dev.clean",
+    //     "--data_test_split", "test.clean",
+    //     "--batch_size", "32",
+    //     "--epochs", "10",
+    //     "--test_mode"
+    //   ],
+    //   // 환경변수 설정
+    //   "env": {
+    //     "HF_DATASETS_CACHE": "/root/.cache/huggingface/datasets",
+    //     "EXP_NAME": "conformer_libri100_baseline_test"
+    //   },
+    //   // 콘솔 출력을 VSCode 통합 터미널에
+    //   "console": "integratedTerminal",
+    //   // 작업 디렉토리
+    //   "cwd": "${workspaceFolder}"
+    // }
+    
+  ]
 }

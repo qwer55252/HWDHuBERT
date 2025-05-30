@@ -1,4 +1,3 @@
-
 """
 train_conformer_small.py
 
@@ -26,16 +25,16 @@ from omegaconf import OmegaConf
 from copy import deepcopy
 from nemo.utils.app_state import AppState
 from torch.utils.data import DataLoader
-from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 import glob
 import zipfile
 import torch.nn.functional as F
 from pruning_utils import (
     get_avg_attention_matrices,
     cluster_and_select_heads,
-    prune_conformer_attention
+    prune_conformer_attention,
+    find_remaining_heads,
+    find_heads_to_keep
 )
-from transformers import Wav2Vec2Processor
 from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 from dataclasses import dataclass
 from typing import Union, Optional
@@ -87,33 +86,13 @@ class ConformerCTCDataCollator:
             label_lengths,       # Tensor [B]
         )
 
+
 def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str):
     """
     HuggingFace Dataset 객체(ds)를 순회하며
     NeMo 형식의 JSON manifest를 생성
     """
-    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
-
     # 기본 HF_DATASETS_CACHE (원본 오디오가 풀리던 위치)
-    default_root = config.HF_DATASETS_CACHE
-    extract_marker = os.path.join("extracted")
-
-    # with open(manifest_path, "w") as fout:
-    #     for sample in ds:
-    #         audio = sample["audio"]
-    #         orig_path = audio["path"] 
-    #         # sample["audio"]["path"] : '/workspace/data/cache/extracted/28e1f76d85906acbe5672f913bb405be336b2a2aa63d4db4a3d1546fd2728272/2277-149896-0000.flac'
-    #         # 실제 데이터 경로 : '/workspace/data/cache/extracted/28e1f76d85906acbe5672f913bb405be336b2a2aa63d4db4a3d1546fd2728272/LibriSpeech/dev-clean/2277/149896/2277-149896-0000.flac'
-            
-
-    #         duration = len(audio["array"]) / audio["sampling_rate"]
-    #         entry = {
-    #             "audio_filepath": orig_path,  # 실제로 존재하는 절대/상대 경로
-    #             "duration": duration,
-    #             "text": sample["text"].lower().strip(),
-    #         }
-    #         fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
     os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
     # HF가 flac을 풀어놓는 최상위 디렉토리
     extract_root = os.path.join(cache_dir, "extracted")
@@ -192,6 +171,36 @@ def save_weights_only_nemo(model, checkpoint_path, save_path):
     finally:
         # 6) 임시 디렉터리 삭제
         shutil.rmtree(pack_dir)
+
+def setup_nemo_datasets_and_cfg(model, train_ds, val_ds, test_ds, collator, train_manifest, val_manifest, test_manifest, args):
+    """
+    NeMo 모델의 cfg와 데이터셋, collator를 일관되게 할당하고 setup_training_data를 호출합니다.
+    """
+    model.cfg.train_ds.is_tarred = False
+    model.cfg.train_ds.tarred_audio_filepaths = None
+    model.cfg.train_ds.manifest_filepath = train_manifest
+    model.cfg.train_ds.sample_rate = args.data_sample_rate
+    model.cfg.train_ds.batch_size = args.batch_size
+
+    model.cfg.validation_ds.is_tarred = False
+    model.cfg.validation_ds.tarred_audio_filepaths = None
+    model.cfg.validation_ds.manifest_filepath = val_manifest
+    model.cfg.validation_ds.sample_rate = args.data_sample_rate
+    model.cfg.validation_ds.batch_size = args.batch_size
+
+    model.cfg.test_ds.is_tarred = False
+    model.cfg.test_ds.tarred_audio_filepaths = None
+    model.cfg.test_ds.manifest_filepath = test_manifest
+    model.cfg.test_ds.sample_rate = args.data_sample_rate
+    model.cfg.test_ds.batch_size = args.batch_size
+
+    model.train_dataset = train_ds
+    model.val_dataset = val_ds
+    model.test_dataset = test_ds
+    model.batch_size = args.batch_size
+    model.data_collator = collator
+
+    model.setup_training_data(model.cfg.train_ds)
 
 class My_EncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
     def __init__(self, cfg, trainer=None):
@@ -353,6 +362,37 @@ def main():
         action="store_true",
         help="테스트 모드일 때 True로 설정하면 데이터셋을 매우 적게 사용"
     )
+    parser.add_argument(
+        "--iterative_finetune_epochs",
+        type=int,
+        default=2,
+        help="각 Iteration마다 미세튜닝할 epoch 수"
+    )
+    parser.add_argument(
+        "--final_finetune_epochs",
+        type=int,
+        default=50,
+        help="최종 Pruning 이후 미세튜닝 epoch 수"
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="redundancy-based",
+        choices=["redundancy-based", "mag-based", "l0-based", "baseline"],
+        help="Pruning 방법 선택 (redundancy-based, mag-based, l0-based, baseline)"
+    )
+    parser.add_argument(
+        "--prune_ratio",
+        type=float,
+        default=0.8,
+        help="전체 헤드 중 제거할 비율 (0.0 ~ 1.0)"
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=10,
+        help="Iterative Pruning 반복 횟수"
+    )
     args = parser.parse_args()
 
     # manifest 경로 설정
@@ -422,13 +462,32 @@ def main():
         print(f"test_manifest DONE: {test_manifest}")
     print("manifest files built.")
     
-    if args.test_mode: # 100개 데이터만 사용
+    # test_mode일 때는 별도의 작은 manifest 파일을 생성
+    if args.test_mode:
         train_ds = train_ds.select(range(100))
         val_ds = val_ds.select(range(100))
         test_ds = test_ds.select(range(100))
+        args.iterative_finetune_epochs = 2
+        args.final_finetune_epochs = 5
+
+        # test_mode용 manifest 경로
+        test_train_manifest = os.path.join(manifest_dir, "train_testmode.json")
+        test_val_manifest = os.path.join(manifest_dir, "val_testmode.json")
+        test_test_manifest = os.path.join(manifest_dir, "test_testmode.json")
+
+        # 항상 새로 생성 (작으니 시간 부담 없음)
+        build_manifest_from_hf(train_ds, test_train_manifest, cache_dir)
+        build_manifest_from_hf(val_ds, test_val_manifest, cache_dir)
+        build_manifest_from_hf(test_ds, test_test_manifest, cache_dir)
+
+        # 이후 코드에서 사용할 manifest 경로를 test_mode용으로 교체
+        train_manifest = test_train_manifest
+        val_manifest = test_val_manifest
+        test_manifest = test_test_manifest
         
 
     # 3) W&B logger 생성
+    prj_name = os.getenv("PRJ_NAME")
     exp_name = os.getenv("EXP_NAME")
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.output_dir,
@@ -442,7 +501,8 @@ def main():
     # 4) PyTorch Lightning Trainer
     cfg_dict = vars(args)
     wandb_logger = WandbLogger(
-        project=exp_name,
+        project=prj_name,
+        name=exp_name,
         save_dir=args.output_dir,
         config=cfg_dict,   # pure dict
     )
@@ -476,60 +536,160 @@ def main():
     
 
     # 새로운 manifest 경로로 덮어쓰기
-    model.cfg.train_ds.is_tarred = False # manifest_filepath 기반으로 데이터 Load하기 위한 설정
-    model.cfg.train_ds.tarred_audio_filepaths = None
-    model.cfg.train_ds.manifest_filepath      = train_manifest
-    model.cfg.train_ds.sample_rate            = args.data_sample_rate
-    model.cfg.train_ds.batch_size             = args.batch_size
-
-    model.cfg.validation_ds.is_tarred = False
-    model.cfg.validation_ds.tarred_audio_filepaths = None
-    model.cfg.validation_ds.manifest_filepath = val_manifest
-    model.cfg.validation_ds.sample_rate       = args.data_sample_rate
-    model.cfg.validation_ds.batch_size        = args.batch_size
-    
-    
-    model.cfg.test_ds.is_tarred = False
-    model.cfg.test_ds.tarred_audio_filepaths = None
-    model.cfg.test_ds.manifest_filepath       = test_manifest
-    model.cfg.test_ds.sample_rate             = args.data_sample_rate
-    model.cfg.test_ds.batch_size              = args.batch_size
-    
-    model.train_dataset = train_ds
-    model.val_dataset = val_ds
-    model.test_dataset = test_ds
-    model.batch_size = args.batch_size
-    model.data_collator = collator
-    
-    model.setup_training_data(model.cfg.train_ds) 
-    
-    
+    setup_nemo_datasets_and_cfg(
+        model, train_ds, val_ds, test_ds, collator,
+        train_manifest, val_manifest, test_manifest, args
+    )
     
     # 파이썬에서 Nemo API로 풀어두는 함수 실행
     release_nemoAPI(model)
     
     # 올바른 속성 이름으로 변경
     model._save_restore_connector.model_extracted_dir = f"{args.output_dir}/nemo_archive"
-    
     AppState().nemo_file_folder = f"{args.output_dir}/nemo_archive"
+    
+    
+    # Stage 3: Iterative Pruning
+    init_num_layers = model.cfg.encoder.n_layers  # conformer-small 예시: 16
+    init_num_heads = model.cfg.encoder.n_heads  # conformer-small 예    
+    init_total_heads = init_num_layers * init_num_heads # conformer-small 예시: 64
+    heads_to_remove_per_iter = int(init_total_heads * args.prune_ratio / args.iterations)
+    already_pruned_heads_dict = {i: set() for i in range(init_num_layers)}
+    
+    if args.method == "redundancy-based":
+        avg_attn_matrices = get_avg_attention_matrices(
+            model, 
+            dataset=train_ds,   # batch마다 model(**batch, output_attentions=True) 필요
+            data_collator=collator,
+            sample_size=10,
+            already_pruned_heads=already_pruned_heads_dict
+        )
+        heads_to_keep = find_heads_to_keep(avg_attn_matrices, already_pruned_heads_dict, init_total_heads, args) # [(head_idx, avg_similarity), ...]
+        print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들: {heads_to_keep}')
+    else:
+        heads_to_keep = []
+    
+    
+    trainer_i = pl.Trainer(
+        devices=args.gpus,
+        accelerator="gpu",
+        max_epochs=args.iterative_finetune_epochs,
+        default_root_dir=args.output_dir,
+        logger=wandb_logger,
+        callbacks=[checkpoint_callback],
+    )
 
-    # 8) 학습 시작
-    _orig = wandb_logger.log_hyperparams
-    wandb_logger.log_hyperparams = lambda *args, **kwargs: None
-    trainer.fit(model)
-    wandb_logger.log_hyperparams = _orig
+    # init_model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
+    #     model_name="stt_en_conformer_ctc_small",
+    #     map_location="cuda:0",
+    #     trainer=trainer,
+    # )
+    if args.method == "baseline":
+        pass
+    else:
+        for i in range(args.iterations):
+            # model_i pruning 하고 short fine-tuning
+            model_i = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
+                model_name="stt_en_conformer_ctc_small",
+                map_location="cuda:0",
+                trainer=trainer_i,
+            )
+            setup_nemo_datasets_and_cfg(
+                model_i, train_ds, val_ds, test_ds, collator,
+                train_manifest, val_manifest, test_manifest, args
+            )
+
+            print(f' - {i+1}번째 itertaion pruning 할 head : {already_pruned_heads_dict}')
+            prune_conformer_attention(model_i, already_pruned_heads_dict)
+            
+            _orig = wandb_logger.log_hyperparams
+            wandb_logger.log_hyperparams = lambda *args, **kwargs: None
+            trainer_i.fit(model_i)
+            wandb_logger.log_hyperparams = _orig
+            
+            # 다음 iteration에서 제거할 헤드 추가
+            if args.method == "redundancy-based":
+                # 2) 평균 어텐션 계산 (train_ds에서 랜덤 샘플)
+                avg_attn_matrices = get_avg_attention_matrices(
+                    model, 
+                    dataset=train_ds,   # batch마다 model(**batch, output_attentions=True) 필요
+                    data_collator=collator,
+                    sample_size=10,
+                    already_pruned_heads=already_pruned_heads_dict
+                )
+
+                # 4) 클러스터링으로 제거할 헤드 선정
+                n_remove = heads_to_remove_per_iter
+                remove_candidates = cluster_and_select_heads(
+                    avg_attn_matrices,
+                    n_remove=n_remove,
+                    init_num_total_heads=init_total_heads,
+                    already_pruned_heads=already_pruned_heads_dict,
+                    test_mode=args.test_mode,
+                    init_num_heads=init_num_heads,
+                    heads_to_keep=heads_to_keep
+                )
+                current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_total_heads)
+                print(f" - 현재 남아있는 전체 헤드 수: {current_num_heads}")            
+                
+                for (lyr_idx, h_idx) in remove_candidates:
+                    if h_idx in already_pruned_heads_dict[lyr_idx]:
+                        print(f' - 이미 제거된 head 이니 건너뜀: ({lyr_idx}, {h_idx})')
+                        continue
+                    h_g_idx = lyr_idx * init_num_heads + h_idx
+                    if h_g_idx in heads_to_keep:
+                        print(f' - 중요하다 판단해서 제거하지 않을 head 이니 건너뜀: ({lyr_idx}, {h_idx})')
+                        continue
+                    # 이 head까지 pruning하면 해당 layer에 더이상 남는 head가 없다면 skip
+                    if len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                        print(f' - 이 head까지 제거하면 더이상 남는 head가 없어서 건너뜀: ({lyr_idx}, {h_idx})')
+                        continue
+                    # already_pruned_heads_dict 갱신    
+                    already_pruned_heads_dict[lyr_idx].add(h_idx)
+        
+        # Stage 4: Final Fine-tuning
+        # 4) PyTorch Lightning Trainer
+        trainer = pl.Trainer(
+            devices=args.gpus,
+            accelerator="gpu",
+            max_epochs=args.final_finetune_epochs,
+            default_root_dir=args.output_dir,
+            logger=wandb_logger,
+            callbacks=[checkpoint_callback],
+        )
+
+        model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
+            model_name="stt_en_conformer_ctc_small",
+            map_location="cuda:0",
+            trainer=trainer,
+        )
+        
+        setup_nemo_datasets_and_cfg(
+            model, train_ds, val_ds, test_ds, collator,
+            train_manifest, val_manifest, test_manifest, args
+        )
+        
+        
+        print(f' 최종 모델 구조의 already_pruned_heads_dict : {already_pruned_heads_dict}')
+        prune_conformer_attention(model, already_pruned_heads_dict)
+        
+        _orig = wandb_logger.log_hyperparams
+        wandb_logger.log_hyperparams = lambda *args, **kwargs: None
+        trainer.fit(model)
+        wandb_logger.log_hyperparams = _orig
+        
+        # 학습한 모델 저장
+        best_ckpt = checkpoint_callback.best_model_path
+        os.makedirs(f"{args.output_dir}/{exp_name}", exist_ok=True)
+        model.save_to(f"{args.output_dir}/{exp_name}/result_weight_{exp_name}.nemo")
+        print(f"Saved .nemo to {args.output_dir}/{exp_name}")
     
-    # 9) Best checkpoint 로드 후 .nemo로 저장
-    best_ckpt = checkpoint_callback.best_model_path
-    nemo_out  = os.path.join(args.output_dir, exp_name,
-                            f"result_weight_{exp_name}.nemo")
-    save_weights_only_nemo(model, best_ckpt, nemo_out)
     
-    # 10) 평가 시작
+    # Stage 5: Evaluation
     split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
     metrics = {}
     for i, split_name in enumerate(split_names):
-        print(f"\n===== Evaluating on split: {split_name} =====")
+        print(f"\n===== Evaluating on splㄴit: {split_name} =====")
         model.eval()
 
         test_i_ds = load_dataset(

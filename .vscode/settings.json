@@ -1,0 +1,8 @@
+{
+  // 이미 설정이 있다면 쉼표 주의!
+  "python.analysis.extraPaths": [
+    "./NeMo"
+  ],
+  "python.analysis.useLibraryCodeForTypes": true,
+  "python.analysis.indexing": true
+}

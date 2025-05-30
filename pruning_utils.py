@@ -10,7 +10,9 @@ from sklearn.cluster import SpectralClustering
 from tqdm import tqdm
 from transformers.pytorch_utils import prune_linear_layer
 
-
+# =============== #
+# Redundancy Matrix 관련 함수들
+# =============== #
 def cosine_distance(vec1, vec2):
     """1 - cosine similarity"""
     # scipy의 cosine()는 distance를 바로 반환하므로 그대로 사용해도 됨
@@ -81,10 +83,6 @@ def get_token_based_distance(matA, matB, metric="cosine"):
 
     return np.mean(distances)
 
-
-# =============== #
-# Sentence-based distance 함수들
-# =============== #
 def distance_correlation(A, B):
     """
     Distance correlation(Szekely 등)은 임의 차원 행렬 간 독립성/종속성을
@@ -225,18 +223,19 @@ def find_pruneable_heads_and_indices(heads, num_heads, head_dim, already_pruned_
     index = torch.arange(num_heads * head_dim)[mask] # num_heads * head_dim == mask.size(0) 여야함
     return heads, index
 
-def prune_conformer_block_attention(attn_module, heads_to_prune):
+def prune_conformer_block_attention(layer_module, heads_to_prune):
     """
     Nemo ConformerBlock.self_attention (MultiHeadAttentionTorch) 에서 head pruning
       - attn_module.query_proj, key_proj, value_proj, out_proj 에 prune 적용
-      - attn_module.num_heads, attn_module.head_dim 업데이트
+      - attn_module.h, attn_module.d_k 업데이트
     """
+    attn_module = layer_module.self_attn
     if not heads_to_prune:
         return
 
     # 기존 num_heads, head_dim
-    num_heads = attn_module.num_heads
-    head_dim  = attn_module.head_dim  # d_model // num_heads
+    num_heads = attn_module.h
+    head_dim  = attn_module.d_k  # d_model // num_heads
     d_model   = num_heads * head_dim
 
     # 이미 prune 된 head 정보가 있으면 반영
@@ -246,16 +245,30 @@ def prune_conformer_block_attention(attn_module, heads_to_prune):
     heads, index = find_pruneable_heads_and_indices(
         heads_to_prune, num_heads, head_dim, already_pruned, num_attention_heads=num_heads
     )
+    # head_indices: 남길 head의 인덱스 (0~num_heads-1 중)
+    head_indices = torch.arange(num_heads)[~torch.tensor([h in heads for h in range(num_heads)])]
+    head_indices = head_indices.to(attn_module.pos_bias_u.device)  # device 일치
+
 
     # Q, K, V, Out projection 각각 prune
-    attn_module.query_proj = prune_linear_layer(attn_module.query_proj, index, dim=0)
-    attn_module.key_proj   = prune_linear_layer(attn_module.key_proj,   index, dim=0)
-    attn_module.value_proj = prune_linear_layer(attn_module.value_proj, index, dim=0)
-    attn_module.out_proj   = prune_linear_layer(attn_module.out_proj,   index, dim=1)
+    attn_module.linear_q = prune_linear_layer(attn_module.linear_q, index, dim=0)
+    attn_module.linear_k   = prune_linear_layer(attn_module.linear_k, index, dim=0)
+    attn_module.linear_v = prune_linear_layer(attn_module.linear_v, index, dim=0)
+    attn_module.linear_out   = prune_linear_layer(attn_module.linear_out, index, dim=1)
+    attn_module.linear_pos = prune_linear_layer(attn_module.linear_pos, index, dim=0)  # ConformerBlock에서 positional encoding도 있음
+    # 여기 linear_pos도 해야되나? -> 해야되는거같은데...
+    # pos_bias_u, pos_bias_v도 head 기준으로 pruning
+    if hasattr(attn_module, "pos_bias_u") and attn_module.pos_bias_u is not None:
+        attn_module.pos_bias_u = torch.nn.Parameter(attn_module.pos_bias_u[head_indices].detach().clone())
+    if hasattr(attn_module, "pos_bias_v") and attn_module.pos_bias_v is not None:
+        attn_module.pos_bias_v = torch.nn.Parameter(attn_module.pos_bias_v[head_indices].detach().clone())
+
+    
 
     # 업데이트
-    attn_module.num_heads    = num_heads - len(heads)
-    attn_module.all_head_size = attn_module.num_heads * attn_module.head_dim
+    attn_module.h    = num_heads - len(heads)
+    layer_module.n_heads = attn_module.h  # ConformerBlock에서 n_heads도 업데이트
+    # attn_module.d_model = attn_module.h * head_dim
     attn_module.pruned_heads  = already_pruned.union(heads)
 
 def prune_conformer_attention(model, heads_to_prune_dict):
@@ -271,10 +284,10 @@ def prune_conformer_attention(model, heads_to_prune_dict):
     """
     
     for layer_idx, prune_head_list in heads_to_prune_dict.items():
-        layer_module = model.wav2vec2.encoder.layers[layer_idx]
+        layer_module = model.encoder.layers[layer_idx]
         # layer_module = model.hubert.encoder.layers[layer_idx]
         # layer_module.attention: Wav2Vec2Attention
-        prune_conformer_block_attention(layer_module.attention, prune_head_list, model.config)
+        prune_conformer_block_attention(layer_module, prune_head_list)
 
 def my_compute_loss_ctc(outputs, labels, processor=None, blank_token_id=None, num_items_in_batch=None):
     """
@@ -331,8 +344,8 @@ def pad_attention_tensors_to_max(avg_attn_per_layer, model_config, already_prune
     """
     # TODO: 그냥 12layer, 12head로 padding 하도록 수정. 단 already_pruned_heads는 zero padding을 사이사이에 알맞은 인덱스에 넣어줘야함.
     # 1. 최대 헤드 수 찾기
-    init_num_layer = model_config.num_hidden_layers
-    init_num_head = model_config.num_attention_heads
+    init_num_layer = model_config.encoder.n_layers
+    init_num_head = model_config.encoder.n_heads
     # max_heads = max(tensor.size(0) for tensor in attn_tensors)
     seq_len = avg_attn_per_layer[0].size(1)  # 모든 Head의 seq_len은 동일함
     device = avg_attn_per_layer[0].device
@@ -361,50 +374,58 @@ def pad_attention_tensors_to_max(avg_attn_per_layer, model_config, already_prune
     padded_tensors = torch.stack(padded_layer_tensors, dim=0)  # [init_num_layer, init_num_head, seq_len, seq_len]
     return padded_tensors
 
-def get_avg_attention_matrices(model, processor, dataset, data_collator, sample_size=10, already_pruned_heads=None): # TODO: sample_size config에서 수정하도록
-    """
-    랜덤하게 sample_size개를 뽑아, 모델 forward(attention) -> 평균 attention matrix 획득
-    반환 shape: (num_layers, num_heads, seq_len, seq_len)
-    """
-    print(f'---------- START get_avg_attention_matrices ----------')
-    # 1) sample_size개 추출
-    idxs = random.sample(range(len(dataset)), sample_size)
-    sampled_data = [dataset[i] for i in idxs]
-
-    # 2) 전처리 후 모델 forward
+def get_avg_attention_matrices(model, dataset, data_collator, sample_size=10, already_pruned_heads=None):
     model.eval()
-    inputs = data_collator(sampled_data)
+    collected = []
+
+    # 1) Conformer 블록을 직접 순회하며 hook 등록
+    handles = []
+    num_layers = model.encoder.n_layers
+    for layer_idx in range(num_layers):
+        mha = model.encoder.layers[layer_idx].self_attn
+        def make_hook(li):
+            def hook(mod, inp, out): # out == (features, attn_probs)
+                attn = out[1]                # [B, H, T, T]
+                collected.append((li, attn.cpu()))
+            return hook
+        handles.append(mha.register_forward_hook(make_hook(layer_idx)))
+
+    # 2) 데이터 샘플링 및 forward
+    idxs = random.sample(range(len(dataset)), sample_size)
+    sampled = [dataset[i] for i in idxs]
+    input_signal, input_signal_length, _, _ = data_collator(sampled)
     with torch.no_grad():
-        outputs = model(
-            input_values=inputs["input_values"].to(model.device),
-            attention_mask=inputs["attention_mask"].to(model.device),
-            output_attentions=True
+        _ = model(
+            input_signal=input_signal.to(model.device),
+            input_signal_length=input_signal_length.to(model.device),
         )
-    # 3) 배치 차원 평균
-    # outputs.attentions: (num_layers, B, num_heads, seq_len, seq_len)
-    attn_tensors = outputs.attentions  # tuple of length num_layers
-    # stack -> (num_layers, B, num_heads, seq_len, seq_len)
-    
+
+    # 3) hook 해제
+    for h in handles:
+        h.remove()
+
+    # 4) 레이어별로 모은 attn을 평균 내기
+    from collections import defaultdict
+    layer_dict = defaultdict(list)
+    for layer_idx, attn in collected:
+        layer_dict[layer_idx].append(attn)  # attn shape: [B, H, T, T]
+
     avg_attn_per_layer = []
+    for li in range(num_layers):
+        # layer_dict[li]: [tensor1, tensor2, ...], 각 tensor shape: [B, H, T, T]
+        # stack → [num_batches, B, H, T, T] → cat → [total_B, H, T, T]
+        # 실제로는 batch마다 shape이 다를 수 있으니, 우선 [N, H, T, T]로 stack
+        attn_list = layer_dict[li]  # 각 요소: [B, H, T, T]
+        attn_cat = torch.cat(attn_list, dim=0)  # [total_B, H, T, T]
+        avg = attn_cat.mean(dim=0)  # [H, T, T]
+        avg_attn_per_layer.append(avg)
     
-    for layer_idx, tensor in enumerate(attn_tensors):
-        # tensor shape: [B, num_heads, seq_len, seq_len]
-        # 배치 차원(B)에서 평균을 계산하여 [num_heads, seq_len, seq_len] 형태로 변환
-        avg_attn = tensor.mean(dim=0)  # [num_heads, seq_len, seq_len]
-        avg_attn_per_layer.append(avg_attn.cpu())
-        print(f'Layer {layer_idx} avg_attn shape: {avg_attn.shape}')
-    
-    
+    # avg_attn_per_layer: [num_layers, num_heads, seq_len, seq_len]
 
-    # 4) 패딩을 적용하여 스택
-    padded_avg_attn = pad_attention_tensors_to_max(avg_attn_per_layer, model.config, already_pruned_heads)  # [num_layers, max_heads, seq_len, seq_len]
-    print(f'padded_avg_attn shape: {padded_avg_attn.shape}') # padded_avg_attn shape: torch.Size([12, 12, 764, 764])
-    print(f'---------- END get_avg_attention_matrices ----------')
-    return padded_avg_attn
+    # 5) 기존 padding 로직 재사용
+    padded = pad_attention_tensors_to_max(avg_attn_per_layer, model.cfg, already_pruned_heads)
+    return padded
 
-    # attn_stack = torch.stack(attn_tensors, dim=0)  # shape 동일
-    # avg_attn = attn_stack.mean(dim=1)              # (num_layers, num_heads, seq_len, seq_len)
-    # return avg_attn.cpu()
 
 def delete_pruned_heads_from_similarity_matrix(similarity_matrix, already_pruned_heads, heads_to_keep, init_num_heads=12):
     '''
@@ -604,10 +625,3 @@ def find_heads_to_keep(attn_matrices, already_pruned_heads_dict, init_num_total_
     heads_to_keep = [head_idx for head_idx, _ in heads_to_keep]
     print(f" - Heads to keep: {heads_to_keep}")
     return heads_to_keep
-
-def find_remaining_heads(already_pruned_heads_dict, init_num_total_heads): # 현재 남은 전체 헤드 수 계산
-    pruned_heads_num = 0
-    for layer_idx, pruned_heads in already_pruned_heads_dict.items():
-        pruned_heads_num += len(pruned_heads)
-    remaining_heads_num = init_num_total_heads - pruned_heads_num
-    return remaining_heads_num
