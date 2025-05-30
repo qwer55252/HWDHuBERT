@@ -170,7 +170,7 @@ def compute_pairwise_distances(attention_mats, distance_func, mode="token", metr
     return dist_matrix
 
 # 클러스터링 결과로부터 layer_to_keep(유지할 head) -> heads_to_prune(제거할 head) 변환
-def build_prune_dict(model_config, layer_to_keep_dict):
+def build_prune_dict(layer_to_keep_dict, layers_num, heads_num):
     """
     layer_to_keep_dict: 예) {0: [0, 2], 1: [1, 3, 5], ...}
     model_config: model.config (Wav2Vec2Config)
@@ -178,10 +178,10 @@ def build_prune_dict(model_config, layer_to_keep_dict):
     반환: heads_to_prune 형태의 dict
        예) { layer_i: [prune_head_idx1, prune_head_idx2, ...], ... }
     """
-    num_attention_heads = model_config.num_attention_heads  # 보통 12
+    num_attention_heads = heads_num  # 보통 12
     heads_to_prune = {}
     
-    for layer_idx in range(model_config.num_hidden_layers):
+    for layer_idx in range(layers_num):
         keep_heads = set(layer_to_keep_dict.get(layer_idx, []))
         # 만약 해당 레이어에 유지할 헤드가 없다면, 기본값으로 0번 헤드를 유지
         if not keep_heads:

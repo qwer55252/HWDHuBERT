@@ -33,8 +33,14 @@ from pruning_utils import (
     cluster_and_select_heads,
     prune_conformer_attention,
     find_remaining_heads,
-    find_heads_to_keep
+    find_heads_to_keep,
+    compute_pairwise_distances,
+    get_token_based_distance,
+    build_prune_dict
 )
+import numpy as np
+from sklearn.cluster import SpectralClustering
+from pruning_utils import prune_conformer_attention
 from nemo.core.connectors.save_restore_connector import SaveRestoreConnector
 from dataclasses import dataclass
 from typing import Union, Optional
@@ -378,8 +384,8 @@ def main():
         "--method",
         type=str,
         default="redundancy-based",
-        choices=["redundancy-based", "mag-based", "l0-based", "baseline"],
-        help="Pruning 방법 선택 (redundancy-based, mag-based, l0-based, baseline)"
+        choices=["redundancy-based", "magnitude-based", "l0-based", "baseline", "one-shot"],
+        help="Pruning 방법 선택 (redundancy-based, magnitude-based, l0-based, baseline)"
     )
     parser.add_argument(
         "--prune_ratio",
@@ -475,6 +481,7 @@ def main():
         test_ds = test_ds.select(range(100))
         args.iterative_finetune_epochs = 2
         args.final_finetune_epochs = 5
+        args.epochs = 10
 
         # test_mode용 manifest 경로
         test_train_manifest = os.path.join(manifest_dir, "train_testmode.json")
@@ -594,6 +601,60 @@ def main():
     if args.method == "baseline":
         # TODO: baseline 코드 별도로 파일 있으니까 그거 여기로 옮기도록
         pass
+    elif args.method == "one-shot":
+        print("▶ One-shot pruning: computing average attention …")
+        avg_attn_matrices = get_avg_attention_matrices(
+            model,
+            dataset=train_ds,
+            data_collator=collator,
+            sample_size=10,
+            already_pruned_heads=already_pruned_heads_dict,
+        )  # Tensor of shape [init_num_layers, init_num_heads, T, T]
+
+        L, H, T, _ = avg_attn_matrices.shape
+        flat_attn = avg_attn_matrices.view(-1, T, T)  # [(L*H), T, T]
+
+        # 2) 헤드 간 pairwise distance → similarity
+        head_distance_matrix = compute_pairwise_distances(
+            flat_attn,
+            distance_func=get_token_based_distance,
+            mode="token",
+            metric=args.distance_metric,
+        )  # shape (L*H, L*H)
+        head_distance_matrix = head_distance_matrix / head_distance_matrix.max()
+        head_similarity_matrix = 1.0 - head_distance_matrix
+
+        # 3) Spectral Clustering으로 대표 헤드 n_keep개 선택
+        total_heads = init_num_total_heads
+        n_keep = int(total_heads * (1.0 - args.prune_ratio))
+        clustering = SpectralClustering(
+            n_clusters=n_keep,
+            affinity="precomputed",
+            assign_labels="kmeans",
+            random_state=42,
+        )
+        cluster_labels = clustering.fit_predict(head_similarity_matrix)  # shape (total_heads,)
+
+        # 4) 클러스터별 첫 등장 헤드를 대표로 선택
+        cluster_to_rep = {}
+        for head_idx, c in enumerate(cluster_labels):
+            cluster_to_rep.setdefault(c, head_idx)
+
+        # 5) layer→keep할 head list 구성, 최소 한 개 보장
+        layer_to_keep = {i: [] for i in range(init_num_layers)}
+        for rep in cluster_to_rep.values():
+            lyr = rep // init_num_heads
+            h_in_layer = rep % init_num_heads
+            layer_to_keep[lyr].append(h_in_layer)
+        for i in range(init_num_layers):
+            if not layer_to_keep[i]:
+                layer_to_keep[i] = [0]
+
+        # 6) prune dict 생성 및 적용
+        heads_to_prune = build_prune_dict(layer_to_keep, init_num_layers, init_num_heads)
+        print(f"▶ One-shot prune plan: {heads_to_prune}")
+        prune_conformer_attention(model, heads_to_prune)
+        print("▶ One-shot head pruning complete.")
     else:
         for i in range(args.iterations):
             # model_i pruning 하고 short fine-tuning
@@ -791,16 +852,16 @@ def main():
         print(f' 최종 모델 구조의 already_pruned_heads_dict : {already_pruned_heads_dict}')
         prune_conformer_attention(model, already_pruned_heads_dict)
         
-        _orig = wandb_logger.log_hyperparams
-        wandb_logger.log_hyperparams = lambda *args, **kwargs: None
-        trainer.fit(model)
-        wandb_logger.log_hyperparams = _orig
-        
-        # 학습한 모델 저장
-        best_ckpt = checkpoint_callback.best_model_path
-        os.makedirs(f"{args.output_dir}/{exp_name}", exist_ok=True)
-        model.save_to(f"{args.output_dir}/{exp_name}/result_weight_{exp_name}.nemo")
-        print(f"Saved .nemo to {args.output_dir}/{exp_name}")
+    _orig = wandb_logger.log_hyperparams
+    wandb_logger.log_hyperparams = lambda *args, **kwargs: None
+    trainer.fit(model)
+    wandb_logger.log_hyperparams = _orig
+    
+    # 학습한 모델 저장
+    best_ckpt = checkpoint_callback.best_model_path
+    nemo_out  = os.path.join(args.output_dir, exp_name, f"result_weight_{exp_name}.nemo")
+    save_weights_only_nemo(model, best_ckpt, nemo_out)
+    print(f"✅ Saved weights‐only .nemo to {nemo_out}")
     
     
     # Stage 5: Evaluation
