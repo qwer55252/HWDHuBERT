@@ -557,9 +557,10 @@ def main():
     
     # Stage 3: Iterative Pruning
     init_num_layers = model.cfg.encoder.n_layers  # conformer-small 예시: 16
-    init_num_heads = model.cfg.encoder.n_heads  # conformer-small 예    
-    init_total_heads = init_num_layers * init_num_heads # conformer-small 예시: 64
-    heads_to_remove_per_iter = int(init_total_heads * args.prune_ratio / args.iterations)
+    init_num_heads = model.cfg.encoder.n_heads  # conformer-small 예시: 4
+    init_num_total_heads = init_num_layers * init_num_heads # conformer-small 예시: 64
+    init_head_dim = model.encoder.layers[0].self_attn.d_k  # conformer-small 예시: 44
+    heads_to_remove_per_iter = int(init_num_total_heads * args.prune_ratio / args.iterations)
     already_pruned_heads_dict = {i: set() for i in range(init_num_layers)}
     
     if args.method == "redundancy-based":
@@ -570,7 +571,7 @@ def main():
             sample_size=10,
             already_pruned_heads=already_pruned_heads_dict
         )
-        heads_to_keep = find_heads_to_keep(avg_attn_matrices, already_pruned_heads_dict, init_total_heads, args) # [(head_idx, avg_similarity), ...]
+        heads_to_keep = find_heads_to_keep(avg_attn_matrices, already_pruned_heads_dict, init_num_total_heads, args) # [(head_idx, avg_similarity), ...]
         print(f' - 중요하다 판단해서 제거하지 않을 10개의 heads들: {heads_to_keep}')
     else:
         heads_to_keep = []
@@ -591,6 +592,7 @@ def main():
     #     trainer=trainer,
     # )
     if args.method == "baseline":
+        # TODO: baseline 코드 별도로 파일 있으니까 그거 여기로 옮기도록
         pass
     else:
         for i in range(args.iterations):
@@ -617,7 +619,7 @@ def main():
             if args.method == "redundancy-based":
                 # 2) 평균 어텐션 계산 (train_ds에서 랜덤 샘플)
                 avg_attn_matrices = get_avg_attention_matrices(
-                    model, 
+                    model_i, 
                     dataset=train_ds,   # batch마다 model(**batch, output_attentions=True) 필요
                     data_collator=collator,
                     sample_size=10,
@@ -629,13 +631,13 @@ def main():
                 remove_candidates = cluster_and_select_heads(
                     avg_attn_matrices,
                     n_remove=n_remove,
-                    init_num_total_heads=init_total_heads,
+                    init_num_total_heads=init_num_total_heads,
                     already_pruned_heads=already_pruned_heads_dict,
                     test_mode=args.test_mode,
                     init_num_heads=init_num_heads,
                     heads_to_keep=heads_to_keep
                 )
-                current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_total_heads)
+                current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
                 print(f" - 현재 남아있는 전체 헤드 수: {current_num_heads}")            
                 
                 for (lyr_idx, h_idx) in remove_candidates:
@@ -652,7 +654,117 @@ def main():
                         continue
                     # already_pruned_heads_dict 갱신    
                     already_pruned_heads_dict[lyr_idx].add(h_idx)
-        
+            elif args.method == "magnitude-based":
+                head_importance = []
+                # 1) 각 layer, 각 head에 대해 Q-proj 가중치 L1-norm 계산
+                for layer_idx in range(init_num_layers):
+                    # HuggingFace Wav2Vec2 Attention 모듈
+                    attn = model_i.encoder.layers[layer_idx].self_attn
+                    q_weight = attn.linear_q.weight.data  # shape: [hidden_size, hidden_size]
+                    k_weight = attn.linear_k.weight.data
+                    v_weight = attn.linear_v.weight.data
+                    o_weight = attn.linear_out.weight.data
+                    # TODO: q_weight 만으로 magnitude를 계산해도 돼?
+                    for h in range(init_num_heads):
+                        # 이미 제거된 헤드는 스킵
+                        if h in already_pruned_heads_dict[layer_idx]:
+                            continue
+                        start, end = h * init_head_dim, (h + 1) * init_head_dim
+                        # L1-norm 을 중요도로 사용
+                        q_norm = q_weight[start:end, :].abs().sum()
+                        k_norm = k_weight[start:end, :].abs().sum()
+                        v_norm = v_weight[start:end, :].abs().sum()
+
+                        # Output projection: column block
+                        o_norm = o_weight[:, start:end].abs().sum()
+
+                        # 네 개 블록 합산하여 magnitude로 사용
+                        magnitude = (q_norm + k_norm + v_norm + o_norm).item()
+                        head_importance.append((layer_idx, h, magnitude))
+
+                # 2) 중요도 오름차순 정렬
+                head_importance.sort(key=lambda x: x[2])
+
+                # 3) 이번 iteration 에 제거할 헤드 개수 결정
+                current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
+                n_remove = heads_to_remove_per_iter
+                # 최소 1개는 남기기
+                if current_num_heads <= n_remove:
+                    n_remove = current_num_heads - 1
+
+                # 4) 제거 대상 후보 선택
+                remove_candidates = head_importance[:n_remove]
+                print(f" - magnitude-based 제거할 head 후보: {remove_candidates}")
+
+                # 5) heads_to_prune_dict 및 already_pruned_heads_dict 업데이트
+                cnt = 0
+                for (lyr_idx, h_idx, _) in remove_candidates:
+                    # 해당 layer 에 최소 1개는 남도록 보장
+                    while len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                        print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx}) 대신 다른 head로 대체")
+                        lyr_idx, h_idx, _ = head_importance[n_remove + cnt]
+                        cnt += 1
+                    print(f" - 최종 remove head: ({lyr_idx}, {h_idx})")
+                    already_pruned_heads_dict[lyr_idx].add(h_idx)
+            elif args.method == "l0-based":
+                eps = 1e-3
+                head_importance = []
+                # 1) 각 layer, 각 head에 대해 Q/K/V/O-proj 가중치 L0-노름 계산
+                for layer_idx in range(init_num_layers):
+                    attn = model_i.encoder.layers[layer_idx].attention
+                    q_weight = attn.linear_q.weight.data   # [hidden, hidden]
+                    k_weight = attn.linear_k.weight.data
+                    v_weight = attn.linear_v.weight.data
+                    o_weight = attn.linear_out.weight.data
+                    for h in range(init_num_heads):
+                        if h in already_pruned_heads_dict[layer_idx]:
+                            continue
+                        start, end = h * init_head_dim, (h + 1) * init_head_dim
+
+                        # 각 블록에서 비제로 원소 개수 계산
+                        sub_q = q_weight[start:end, :]
+                        sub_k = k_weight[start:end, :]
+                        sub_v = v_weight[start:end, :]
+                        sub_o = o_weight[:, start:end]
+
+                        # nonzero_q = torch.count_nonzero(sub_q)
+                        # nonzero_k = torch.count_nonzero(sub_k)
+                        # nonzero_v = torch.count_nonzero(sub_v)
+                        # nonzero_o = torch.count_nonzero(sub_o)
+                        
+                        nonzero_q = torch.count_nonzero(sub_q.abs() > eps)
+                        nonzero_k = torch.count_nonzero(sub_k.abs() > eps)
+                        nonzero_v = torch.count_nonzero(sub_v.abs() > eps)
+                        nonzero_o = torch.count_nonzero(sub_o.abs() > eps)
+
+                        total_nonzero = (nonzero_q + nonzero_k + nonzero_v + nonzero_o).item()
+                        head_importance.append((layer_idx, h, total_nonzero))
+
+                # 2) 비제로 개수 오름차순 정렬 (가장 스파스한 헤드 우선)
+                head_importance.sort(key=lambda x: x[2])
+
+                # 3) 이번 iteration에 제거할 헤드 수 결정
+                current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
+                n_remove = heads_to_remove_per_iter
+                if current_num_heads <= n_remove:
+                    n_remove = current_num_heads - 1  # 최소 1개는 남기기
+
+                # 4) 제거 대상 후보 선택
+                remove_candidates = head_importance[:n_remove]
+                print(f" - l0-based 제거할 head 후보: {remove_candidates}")
+
+                # 5) heads_to_prune_dict 및 already_pruned_heads_dict 업데이트
+                cnt = 0
+                for (lyr_idx, h_idx, _) in remove_candidates:
+                    while len(already_pruned_heads_dict[lyr_idx]) + 1 == init_num_heads:
+                        print(f" - layer {lyr_idx}에 남아있는 head가 1개 이하이므로 건너뜀: ({lyr_idx}, {h_idx}) 대신 다른 head로 대체")
+                        lyr_idx, h_idx, _ = head_importance[n_remove + cnt]
+                        cnt += 1
+                    print(f" - 최종 remove head: ({lyr_idx}, {h_idx})")
+                    already_pruned_heads_dict[lyr_idx].add(h_idx)
+            else:
+                raise ValueError(f"Unknown method: {args.method}")
+            
         # Stage 4: Final Fine-tuning
         # 4) PyTorch Lightning Trainer
         trainer = pl.Trainer(
