@@ -772,7 +772,7 @@ def main():
                 head_importance = []
                 # 1) 각 layer, 각 head에 대해 Q/K/V/O-proj 가중치 L0-노름 계산
                 for layer_idx in range(init_num_layers):
-                    attn = model_i.encoder.layers[layer_idx].attention
+                    attn = model_i.encoder.layers[layer_idx].self_attn
                     q_weight = attn.linear_q.weight.data   # [hidden, hidden]
                     k_weight = attn.linear_k.weight.data
                     v_weight = attn.linear_v.weight.data
