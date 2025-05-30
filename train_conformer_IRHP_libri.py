@@ -6,7 +6,7 @@ halved-dimension Conformer CTC 모델 구조(student)를 NeMo로 생성,
 Weights & Biases 로깅 포함
 """
 
-
+import re
 import os
 import torch
 import tempfile
@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 import glob
 import zipfile
 import torch.nn.functional as F
+from transformers import Wav2Vec2Config, Wav2Vec2Processor
 from pruning_utils import (
     get_avg_attention_matrices,
     cluster_and_select_heads,
@@ -275,6 +276,52 @@ class My_EncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
             collate_fn=self.data_collator,
         )
 
+def load_datasets(dataset_name):
+    if dataset_name == "librispeech":
+        train_dataset = load_dataset("openslr/librispeech_asr", "clean", split="train.100", trust_remote_code=True)
+        dev_dataset = load_dataset("openslr/librispeech_asr", "clean", split="validation", trust_remote_code=True)
+        test_dataset = load_dataset("openslr/librispeech_asr", "clean", split="test", trust_remote_code=True)
+    elif dataset_name == "tedlium":
+        train_dataset = load_dataset("./tedlium_test.py", "release1", split="train", trust_remote_code=True)
+        dev_dataset = load_dataset("./tedlium_test.py", "release1", split="validation", trust_remote_code=True)
+        test_dataset = load_dataset("./tedlium_test.py", "release1", split="test", trust_remote_code=True)
+        MAX_SAMPLES = 320000  # 10초
+        train_dataset = train_dataset.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
+        dev_dataset = dev_dataset.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
+        test_dataset = test_dataset.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    
+    return train_dataset, dev_dataset, test_dataset
+
+def preprocess_function(batch, processor):
+    # 1) 오디오 인풋 처리
+    input_values = processor(
+        batch["audio"]["array"],
+        sampling_rate=16_000
+    ).input_values[0]
+    
+    batch["text"] = clean_transcript(batch["text"])  # 텍스트 전처리
+    # 2) 텍스트 라벨은 tokenizer를 직접 호출
+    labels = processor.tokenizer(
+        batch["text"]
+    ).input_ids
+    
+    return {
+        "input_values": input_values,
+        "labels": labels,
+    }
+
+def clean_transcript(text):
+    text = re.sub(r"\{.*?\}", "", text)              # {SMACK}, {BREATH} 등 제거
+    text = re.sub(r"\(.*?\)", "", text)              # (2), (3) 등 제거
+    text = text.replace("<sil>", "")                 # <sil> 제거
+    text = text.upper()                              # 모두 대문자
+    text = re.sub(r"[^A-Z' ]+", "", text)            # A–Z, 공백, ' 만 남기고 제거
+    text = re.sub(r"\s+", " ", text).strip()         # 중복 공백 정리
+    return text
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train halved-dimension Conformer CTC student on LibriSpeech 100h"
@@ -405,6 +452,12 @@ def main():
         default="cosine",
         help="token-based distance 지표('cosine', 'corr', 'js', 'bc') 또는 sentence-based('dCor', 'PC', 'CC') 중 선택"
     )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default="tedlium",
+        help="[librispeech, tedlium]"
+    )
     args = parser.parse_args()
 
     # manifest 경로 설정
@@ -435,23 +488,24 @@ def main():
         force_extract=True,            
     )
     
-    train_ds = load_dataset(
-        args.data_script_path,
-        args.data_config_name,
-        split=args.data_train_split,
-        trust_remote_code=True,
-        download_config=dl_cfg,
-        cache_dir=cache_dir,
-    )
-    val_ds = load_dataset(
-        args.data_script_path,
-        args.data_config_name,
-        split=args.data_val_split,
-        trust_remote_code=True,
-        download_config=dl_cfg,
-        cache_dir=cache_dir,
-    )
-    test_ds = load_dataset(
+    if args.dataset_name == "librispeech":
+        train_ds = load_dataset(
+            args.data_script_path,
+            args.data_config_name,
+            split=args.data_train_split,
+            trust_remote_code=True,
+            download_config=dl_cfg,
+            cache_dir=cache_dir,
+        )
+        val_ds = load_dataset(
+            args.data_script_path,
+            args.data_config_name,
+            split=args.data_val_split,
+            trust_remote_code=True,
+            download_config=dl_cfg,
+            cache_dir=cache_dir,
+        )
+        test_ds = load_dataset(
         args.data_script_path,
         args.data_config_name,
         split=args.data_test_split,
@@ -459,6 +513,17 @@ def main():
         download_config=dl_cfg,
         cache_dir=cache_dir,
     )
+    
+    elif args.dataset_name == "tedlium":
+        train_ds, val_ds, test_ds = load_datasets(dataset_name=args.dataset_name)
+        wav2vec2config = Wav2Vec2Config.from_pretrained(args.model_name_or_path, output_attentions=True)
+        processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-100h", config=wav2vec2config)
+        train_ds = train_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
+        val_ds = val_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
+        test_ds = test_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
+        eval_datasets = {"dev": val_ds, "test": test_ds} # TODO: 정상작동하는지 확인
+        
+    
     print(f'train_ds.cache_files: {train_ds.cache_files}')  # [{'filename': '/home/you/.cache/huggingface/datasets/.../train.arrow', ...}, ...]
     # 2) NeMo manifest 생성
 
@@ -865,34 +930,61 @@ def main():
     
     
     # Stage 5: Evaluation
-    split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
+    # ================================
+    # Stage 5: Evaluation
+    # ================================
+    # 1) 평가할 split 이름과 load_dataset 파라미터 분기
+    MAX_SAMPLES = 320000  # 20초
+    if args.dataset_name == "librispeech":
+        split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
+        script       = args.data_script_path
+        config_name  = args.data_config_name
+        load_kwargs = {
+            "path":       script,
+            "name":       config_name,
+            "trust_remote_code": True,
+            "download_config":   dl_cfg,
+            "cache_dir":  cache_dir,
+        }
+    else:  # tedlium
+        split_names = ["dev", "test"]
+        # tedlium test split load
+        load_kwargs = {
+            "path":       "./tedlium_test.py",
+            "name":       "release1",
+            "trust_remote_code": True,
+        }
+
     metrics = {}
-    for i, split_name in enumerate(split_names):
-        print(f"\n===== Evaluating on splㄴit: {split_name} =====")
+    for split_name in split_names:
+        print(f"\n===== Evaluating on split: {split_name} =====")
         model.eval()
 
+        # 2) 테스트 데이터셋 로드 & (필요시) 필터 & 전처리
         test_i_ds = load_dataset(
-            args.data_script_path,
-            args.data_config_name,
+            load_kwargs["path"],
+            load_kwargs["name"],
             split=split_name,
-            trust_remote_code=True,
-            download_config=dl_cfg,
-            cache_dir=cache_dir,
+            **{k:v for k,v in load_kwargs.items() if k not in ["path","name"]}
         )
+        if args.dataset_name == "tedlium":
+            # 최대 길이 필터 (10초)
+            test_i_ds = test_i_ds.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
+            test_i_ds = test_i_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
+
         if args.test_mode:
             test_i_ds = test_i_ds.select(range(100))
+
+        # 3) manifest 파일 생성
         json_name = split_name.replace(".", "_") + ".json"
         manifest_i = os.path.join(manifest_dir, json_name)
         build_manifest_from_hf(test_i_ds, manifest_i, cache_dir)
 
-        test_data_config = deepcopy(model.cfg.test_ds)
-        test_data_config.manifest_filepath = manifest_i
-        # shuffle 옵션이 없으면 False 로 자동 설정되지만, 명시적으로 꺼줄 수도 있습니다.
-        test_data_config.shuffle = False
-
-        # NeMo API 호출: 내부에서 _test_dl 이 세팅되고,
-        # 이후 test_dataloader() 호출 시 이 _test_dl 이 반환됩니다.
-        model.setup_test_data(test_data_config)
+        # 4) NeMo 테스트 데이터 설정
+        test_cfg = deepcopy(model.cfg.test_ds)
+        test_cfg.manifest_filepath = manifest_i
+        test_cfg.shuffle = False
+        model.setup_test_data(test_cfg)
         dl = model.test_dataloader()
         
         _orig_log_hparams = wandb_logger.log_hyperparams
