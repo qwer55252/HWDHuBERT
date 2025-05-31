@@ -579,8 +579,8 @@ def main():
         train_ds = train_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
         val_ds = val_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
         test_ds = test_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
-        eval_datasets = {"dev": val_ds, "test": test_ds} # TODO: 정상작동하는지 확인
         
+    eval_datasets = {"dev": val_ds, "test": test_ds} # TODO: 정상작동하는지 확인
     
     print(f'train_ds.cache_files: {train_ds.cache_files}')  # [{'filename': '/home/you/.cache/huggingface/datasets/.../train.arrow', ...}, ...]
     # 2) NeMo manifest 생성
@@ -782,6 +782,10 @@ def main():
         prune_conformer_attention(model, heads_to_prune)
         print("▶ One-shot head pruning complete.")
     else:
+        # model 메모리 해제
+        del model
+        torch.cuda.empty_cache()
+        
         # iterative 과정을 통해 already_pruned_heads_dict 생성
         for i in range(args.iterations):
             # model_i pruning 하고 short fine-tuning
