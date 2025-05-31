@@ -458,6 +458,12 @@ def main():
         default="tedlium",
         help="[librispeech, tedlium]"
     )
+    parser.add_argument(
+        "--model_name_or_path", 
+        type=str, 
+        default="nvidia/stt_en_conformer_ctc_small",
+        help="모델 이름 또는 경로 ['nvidia/stt_en_conformer_ctc_small', 'facebook/wav2vec2-base-100h', ...]"
+    )
     args = parser.parse_args()
 
     # manifest 경로 설정
@@ -516,8 +522,13 @@ def main():
     
     elif args.dataset_name == "tedlium":
         train_ds, val_ds, test_ds = load_datasets(dataset_name=args.dataset_name)
-        wav2vec2config = Wav2Vec2Config.from_pretrained(args.model_name_or_path, output_attentions=True)
+        wav2vec2config = Wav2Vec2Config.from_pretrained("facebook/wav2vec2-base-100h", output_attentions=True)
         processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-100h", config=wav2vec2config)
+        if args.test_mode:
+            # test_mode일 때는 데이터셋을 100개로 제한
+            train_ds = train_ds.select(range(100))
+            val_ds = val_ds.select(range(100))
+            test_ds = test_ds.select(range(100))
         train_ds = train_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
         val_ds = val_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
         test_ds = test_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
@@ -595,7 +606,7 @@ def main():
     
 
     model = My_EncDecCTCModelBPE.from_pretrained(
-        model_name="stt_en_conformer_ctc_small",
+        model_name=args.model_name_or_path,
         map_location="cuda:0",
         trainer=trainer,
     )
@@ -657,14 +668,17 @@ def main():
         logger=wandb_logger,
         callbacks=[checkpoint_callback],
     )
-
-    # init_model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
-    #     model_name="stt_en_conformer_ctc_small",
-    #     map_location="cuda:0",
-    #     trainer=trainer,
-    # )
+    trainer = pl.Trainer(
+            devices=args.gpus,
+            accelerator="gpu",
+            max_epochs=args.final_finetune_epochs,
+            default_root_dir=args.output_dir,
+            logger=wandb_logger,
+            callbacks=[checkpoint_callback],
+        )
+    
     if args.method == "baseline":
-        # TODO: baseline 코드 별도로 파일 있으니까 그거 여기로 옮기도록
+        print("▶ Baseline pruning: no pruning applied.")
         pass
     elif args.method == "one-shot":
         print("▶ One-shot pruning: computing average attention …")
@@ -721,10 +735,11 @@ def main():
         prune_conformer_attention(model, heads_to_prune)
         print("▶ One-shot head pruning complete.")
     else:
+        # iterative 과정을 통해 already_pruned_heads_dict 생성
         for i in range(args.iterations):
             # model_i pruning 하고 short fine-tuning
             model_i = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
-                model_name="stt_en_conformer_ctc_small",
+                model_name=args.model_name_or_path,
                 map_location="cuda:0",
                 trainer=trainer_i,
             )
@@ -891,32 +906,20 @@ def main():
             else:
                 raise ValueError(f"Unknown method: {args.method}")
             
-        # Stage 4: Final Fine-tuning
-        # 4) PyTorch Lightning Trainer
-        trainer = pl.Trainer(
-            devices=args.gpus,
-            accelerator="gpu",
-            max_epochs=args.final_finetune_epochs,
-            default_root_dir=args.output_dir,
-            logger=wandb_logger,
-            callbacks=[checkpoint_callback],
-        )
-
+        # 최종 모델 구조 선언
         model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
-            model_name="stt_en_conformer_ctc_small",
+            model_name=args.model_name_or_path,
             map_location="cuda:0",
             trainer=trainer,
         )
-        
         setup_nemo_datasets_and_cfg(
             model, train_ds, val_ds, test_ds, collator,
             train_manifest, val_manifest, test_manifest, args
         )
-        
-        
         print(f' 최종 모델 구조의 already_pruned_heads_dict : {already_pruned_heads_dict}')
         prune_conformer_attention(model, already_pruned_heads_dict)
-        
+    
+    # Stage 4: Final Fine-tuning
     _orig = wandb_logger.log_hyperparams
     wandb_logger.log_hyperparams = lambda *args, **kwargs: None
     trainer.fit(model)
