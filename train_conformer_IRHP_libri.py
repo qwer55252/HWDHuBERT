@@ -183,23 +183,71 @@ def setup_nemo_datasets_and_cfg(model, train_ds, val_ds, test_ds, collator, trai
     """
     NeMo 모델의 cfg와 데이터셋, collator를 일관되게 할당하고 setup_training_data를 호출합니다.
     """
-    model.cfg.train_ds.is_tarred = False
-    model.cfg.train_ds.tarred_audio_filepaths = None
-    model.cfg.train_ds.manifest_filepath = train_manifest
-    model.cfg.train_ds.sample_rate = args.data_sample_rate
-    model.cfg.train_ds.batch_size = args.batch_size
+    # train_ds
+    train_cfg = model.cfg.train_ds
+    if isinstance(train_cfg, dict):
+        is_tarred = train_cfg.get("is_tarred", False)
+    else:
+        is_tarred = getattr(train_cfg, "is_tarred", False)
+    if is_tarred:
+        if isinstance(train_cfg, dict):
+            train_cfg["is_tarred"] = False
+            train_cfg["tarred_audio_filepaths"] = None
+        else:
+            train_cfg.is_tarred = False
+            train_cfg.tarred_audio_filepaths = None
+    if isinstance(train_cfg, dict):
+        train_cfg["manifest_filepath"] = train_manifest
+        train_cfg["sample_rate"] = args.data_sample_rate
+        train_cfg["batch_size"] = args.batch_size
+    else:
+        train_cfg.manifest_filepath = train_manifest
+        train_cfg.sample_rate = args.data_sample_rate
+        train_cfg.batch_size = args.batch_size
 
-    model.cfg.validation_ds.is_tarred = False
-    model.cfg.validation_ds.tarred_audio_filepaths = None
-    model.cfg.validation_ds.manifest_filepath = val_manifest
-    model.cfg.validation_ds.sample_rate = args.data_sample_rate
-    model.cfg.validation_ds.batch_size = args.batch_size
+    # validation_ds
+    val_cfg = model.cfg.validation_ds
+    if isinstance(val_cfg, dict):
+        is_tarred = val_cfg.get("is_tarred", False)
+    else:
+        is_tarred = getattr(val_cfg, "is_tarred", False)
+    if is_tarred:
+        if isinstance(val_cfg, dict):
+            val_cfg["is_tarred"] = False
+            val_cfg["tarred_audio_filepaths"] = None
+        else:
+            val_cfg.is_tarred = False
+            val_cfg.tarred_audio_filepaths = None
+    if isinstance(val_cfg, dict):
+        val_cfg["manifest_filepath"] = val_manifest
+        val_cfg["sample_rate"] = args.data_sample_rate
+        val_cfg["batch_size"] = args.batch_size
+    else:
+        val_cfg.manifest_filepath = val_manifest
+        val_cfg.sample_rate = args.data_sample_rate
+        val_cfg.batch_size = args.batch_size
 
-    model.cfg.test_ds.is_tarred = False
-    model.cfg.test_ds.tarred_audio_filepaths = None
-    model.cfg.test_ds.manifest_filepath = test_manifest
-    model.cfg.test_ds.sample_rate = args.data_sample_rate
-    model.cfg.test_ds.batch_size = args.batch_size
+    # test_ds
+    test_cfg = model.cfg.test_ds
+    if isinstance(test_cfg, dict):
+        is_tarred = test_cfg.get("is_tarred", False)
+    else:
+        is_tarred = getattr(test_cfg, "is_tarred", False)
+    if is_tarred:
+        if isinstance(test_cfg, dict):
+            test_cfg["is_tarred"] = False
+            test_cfg["tarred_audio_filepaths"] = None
+        else:
+            test_cfg.is_tarred = False
+            test_cfg.tarred_audio_filepaths = None
+    if isinstance(test_cfg, dict):
+        test_cfg["manifest_filepath"] = test_manifest
+        test_cfg["sample_rate"] = args.data_sample_rate
+        test_cfg["batch_size"] = args.batch_size
+    else:
+        test_cfg.manifest_filepath = test_manifest
+        test_cfg.sample_rate = args.data_sample_rate
+        test_cfg.batch_size = args.batch_size
 
     model.train_dataset = train_ds
     model.val_dataset = val_ds
@@ -379,7 +427,6 @@ def main():
         default=False,
         help="True: teacher 모델 학습, False: student 모델 학습",
     )
-    
     parser.add_argument(
         "--logit_distillation",
         type=bool,
@@ -512,13 +559,13 @@ def main():
             cache_dir=cache_dir,
         )
         test_ds = load_dataset(
-        args.data_script_path,
-        args.data_config_name,
-        split=args.data_test_split,
-        trust_remote_code=True,
-        download_config=dl_cfg,
-        cache_dir=cache_dir,
-    )
+            args.data_script_path,
+            args.data_config_name,
+            split=args.data_test_split,
+            trust_remote_code=True,
+            download_config=dl_cfg,
+            cache_dir=cache_dir,
+        )
     
     elif args.dataset_name == "tedlium":
         train_ds, val_ds, test_ds = load_datasets(dataset_name=args.dataset_name)
