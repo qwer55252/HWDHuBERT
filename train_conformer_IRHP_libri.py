@@ -256,6 +256,8 @@ def setup_nemo_datasets_and_cfg(model, train_ds, val_ds, test_ds, collator, trai
     model.data_collator = collator
 
     model.setup_training_data(model.cfg.train_ds)
+    model.setup_validation_data(model.cfg.validation_ds)
+    model.setup_test_data(model.cfg.test_ds)
 
 class My_EncDecCTCModelBPE(nemo_asr.models.EncDecCTCModelBPE):
     def __init__(self, cfg, trainer=None):
@@ -573,9 +575,9 @@ def main():
         processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-100h", config=wav2vec2config)
         if args.test_mode:
             # test_mode일 때는 데이터셋을 100개로 제한
-            train_ds = train_ds.select(range(100))
-            val_ds = val_ds.select(range(100))
-            test_ds = test_ds.select(range(100))
+            train_ds = train_ds.select(range(300))
+            val_ds = val_ds.select(range(300))
+            test_ds = test_ds.select(range(300))
         train_ds = train_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
         val_ds = val_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
         test_ds = test_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
@@ -599,9 +601,9 @@ def main():
     
     # test_mode일 때는 별도의 작은 manifest 파일을 생성
     if args.test_mode:
-        train_ds = train_ds.select(range(100))
-        val_ds = val_ds.select(range(100))
-        test_ds = test_ds.select(range(100))
+        train_ds = train_ds.select(range(300))
+        val_ds = val_ds.select(range(300))
+        test_ds = test_ds.select(range(300))
         args.iterative_finetune_epochs = 2
         args.final_finetune_epochs = 5
         args.epochs = 10
@@ -625,6 +627,14 @@ def main():
     # 3) W&B logger 생성
     prj_name = os.getenv("PRJ_NAME")
     exp_name = os.getenv("EXP_NAME")
+    iterative_checkpoint_callback = ModelCheckpoint(
+        dirpath=args.output_dir,
+        filename="best",
+        save_top_k=1,
+        verbose=True,
+        monitor="val_loss",
+        mode="min",
+    )
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.output_dir,
         filename="best",
@@ -707,22 +717,6 @@ def main():
         heads_to_keep = []
     
     
-    trainer_i = pl.Trainer(
-        devices=args.gpus,
-        accelerator="gpu",
-        max_epochs=args.iterative_finetune_epochs,
-        default_root_dir=args.output_dir,
-        logger=wandb_logger,
-        callbacks=[checkpoint_callback],
-    )
-    trainer = pl.Trainer(
-            devices=args.gpus,
-            accelerator="gpu",
-            max_epochs=args.final_finetune_epochs,
-            default_root_dir=args.output_dir,
-            logger=wandb_logger,
-            callbacks=[checkpoint_callback],
-        )
     
     if args.method == "baseline":
         print("▶ Baseline pruning: no pruning applied.")
@@ -782,12 +776,20 @@ def main():
         prune_conformer_attention(model, heads_to_prune)
         print("▶ One-shot head pruning complete.")
     else:
-        # model 메모리 해제
-        del model
-        torch.cuda.empty_cache()
+        # # model 메모리 해제
+        # del model
+        # torch.cuda.empty_cache()
         
         # iterative 과정을 통해 already_pruned_heads_dict 생성
         for i in range(args.iterations):
+            trainer_i = pl.Trainer(
+                devices=args.gpus,
+                accelerator="gpu",
+                max_epochs=args.iterative_finetune_epochs,
+                default_root_dir=args.output_dir,
+                logger=wandb_logger,
+                # callbacks=[iterative_checkpoint_callback],
+            )
             # model_i pruning 하고 short fine-tuning
             model_i = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
                 model_name=args.model_name_or_path,
@@ -831,6 +833,9 @@ def main():
                 )
                 current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
                 print(f" - 현재 남아있는 전체 헤드 수: {current_num_heads}")            
+                del model_i
+                del trainer_i
+                torch.cuda.empty_cache()
                 
                 for (lyr_idx, h_idx) in remove_candidates:
                     if h_idx in already_pruned_heads_dict[lyr_idx]:
@@ -957,6 +962,17 @@ def main():
             else:
                 raise ValueError(f"Unknown method: {args.method}")
             
+        
+        
+        trainer = pl.Trainer(
+            devices=args.gpus,
+            accelerator="gpu",
+            max_epochs=args.final_finetune_epochs,
+            default_root_dir=args.output_dir,
+            logger=wandb_logger,
+            callbacks=[checkpoint_callback],
+        )
+        
         # 최종 모델 구조 선언
         model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
             model_name=args.model_name_or_path,
@@ -988,7 +1004,7 @@ def main():
     # Stage 5: Evaluation
     # ================================
     # 1) 평가할 split 이름과 load_dataset 파라미터 분기
-    MAX_SAMPLES = 320000  # 20초
+    MAX_SAMPLES = 160000  # 20초
     if args.dataset_name == "librispeech":
         split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
         script       = args.data_script_path
@@ -1027,7 +1043,7 @@ def main():
             test_i_ds = test_i_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
 
         if args.test_mode:
-            test_i_ds = test_i_ds.select(range(100))
+            test_i_ds = test_i_ds.select(range(300))
 
         # 3) manifest 파일 생성
         json_name = split_name.replace(".", "_") + ".json"

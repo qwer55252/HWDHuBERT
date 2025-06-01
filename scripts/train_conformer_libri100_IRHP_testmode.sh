@@ -13,9 +13,10 @@ python train_conformer_IRHP_libri.py \
 --data_train_split train.clean.100 \
 --data_val_split dev.clean \
 --data_test_split test.clean \
---batch_size 32 \
---epochs 100 \
+--batch_size 4 \
+--final_finetune_epochs 100 \
 --method "redundancy-based" \
+--dataset_name "librispeech" \
 --prune_ratio 0.5 \
 --test_mode
 
