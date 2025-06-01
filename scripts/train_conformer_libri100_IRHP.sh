@@ -7,14 +7,14 @@ OUTPUT_DIR="./outputs/$EXP_NAME"
 mkdir -p "$OUTPUT_DIR"
 
 # 2) 학습 실행 및 로그 저장
-python train_conformer_IRHP_libri.py \
+python train_conformer_IRHP_libri_new.py \
 --output_dir "$OUTPUT_DIR" \
 --data_config_name train_100 \
 --data_train_split train.clean.100 \
 --data_val_split dev.clean \
 --data_test_split test.clean \
---batch_size 4 \
+--batch_size 16 \
+--iterative_finetune_epochs 4 \
 --final_finetune_epochs 100 \
 --method "redundancy-based" \
---dataset_name "librispeech" \
 --prune_ratio 0.5 \

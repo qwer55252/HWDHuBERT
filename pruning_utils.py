@@ -598,7 +598,7 @@ def find_heads_to_keep(attn_matrices, already_pruned_heads_dict, init_num_total_
             reshaped_attn,
             distance_func=get_token_based_distance,
             mode="token",
-            metric=args.distance_metric
+            metric="cosine",
         )
     else:
         # 테스트용: 0~2 범위의 랜덤 distance matrix 생성
