@@ -27,8 +27,11 @@ from nemo.utils.app_state import AppState
 from torch.utils.data import DataLoader
 import glob
 import zipfile
+import torchaudio
+from evaluate import load
+from typing import Union, Optional, Tuple, Dict, Any
 import torch.nn.functional as F
-from transformers import Wav2Vec2Config, Wav2Vec2Processor
+from transformers import Wav2Vec2Config, Wav2Vec2Processor, TrainingArguments, Trainer, Wav2Vec2ForCTC
 from pruning_utils import (
     get_avg_attention_matrices,
     cluster_and_select_heads,
@@ -48,50 +51,6 @@ from typing import Union, Optional
 from transformers import Wav2Vec2FeatureExtractor
 from nemo.collections.common.tokenizers.sentencepiece_tokenizer import SentencePieceTokenizer
 
-@dataclass
-class ConformerCTCDataCollator:
-    feature_extractor: Wav2Vec2FeatureExtractor
-    tokenizer: SentencePieceTokenizer
-    padding: Union[bool, str] = True  # 이 예제에서는 항상 True 로 가정
-    sampling_rate: int = 16000
-
-    def __call__(self, features):
-        # 1) waveform → feature
-        batch_audio = [f["audio"]["array"] for f in features]
-        inputs = self.feature_extractor(
-            batch_audio,
-            sampling_rate=self.sampling_rate,
-            return_tensors="pt",
-            padding=True,
-            return_attention_mask=True,
-        )
-        input_signal = inputs["input_values"].float()
-        input_signal_length = inputs["attention_mask"].sum(dim=-1)
-
-
-        # 2) text → token IDs 리스트 (no padding yet)
-        raw_texts = [f["text"] for f in features]
-        ids_list  = [self.tokenizer.text_to_ids(text) for text in raw_texts]
-
-        # 3) 리스트를 동일 길이로 패딩
-        batch_size = len(ids_list)
-        max_len    = max(len(ids) for ids in ids_list)
-        pad_id     = self.tokenizer.pad_id  # SentencePieceTokenizer 의 pad token ID
-
-        labels = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
-        for i, ids in enumerate(ids_list):
-            labels[i, : len(ids)] = torch.tensor(ids, dtype=torch.long)
-
-        # 4) CTC ignore index(-100) 로 변환
-        labels = labels.masked_fill(labels == pad_id, -100)
-        label_lengths = (labels != -100).sum(-1)
-
-        return (
-            input_signal,        # Tensor [B, T], float32
-            input_signal_length, # Tensor [B]
-            labels,              # Tensor [B, L], with -100 padding
-            label_lengths,       # Tensor [B]
-        )
 
 
 def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str):
@@ -372,6 +331,182 @@ def clean_transcript(text):
     return text
 
 
+@dataclass
+class ConformerCTCDataCollator:
+    feature_extractor: Wav2Vec2FeatureExtractor
+    tokenizer: SentencePieceTokenizer
+    sampling_rate: int = 16000
+    padding: Union[bool, str] = True
+
+    def __call__(self, features: list[dict]):
+        # features: [{"audio": {"path": "/…/xx.flac"}, "text": "…"}, …]
+        # 1) 배치 내 오디오 파일 경로 리스트
+        batch_paths = [f["audio"]["path"] for f in features]
+
+        # 2) torchaudio 혹은 processor를 이용해 on‐the‐fly load
+        batch_waveforms = []
+        for p in batch_paths:
+            # 예: torchaudio.load or librosa.load (numpy → tensor)
+            waveform, sr = torchaudio.load(p)  # [1, T], sr should match 16k
+            if sr != self.sampling_rate:
+                waveform = torchaudio.functional.resample(waveform, sr, self.sampling_rate)
+            batch_waveforms.append(waveform.squeeze(0))  # [T]
+
+        # 3) feature_extractor로 batch 처리 (padding=True로 배치 내 최대 길이에 맞춰줌)
+        inputs = self.feature_extractor(
+            batch_waveforms,
+            sampling_rate=self.sampling_rate,
+            padding=True,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        input_signal = inputs["input_values"]          # [B, T_max]
+        input_signal_length = inputs["attention_mask"].sum(dim=-1)
+
+        # 4) 텍스트→라벨 시퀀스 (버전 동일)
+        raw_texts = [f["text"] for f in features]
+        ids_list  = [self.tokenizer.text_to_ids(t) for t in raw_texts]
+
+        # 5) 라벨 패딩, CTCLoss용 -100 채우기
+        batch_size = len(ids_list)
+        max_len = max(len(ids) for ids in ids_list)
+        pad_id  = self.tokenizer.pad_id
+
+        labels = torch.full((batch_size, max_len), pad_id, dtype=torch.long)
+        for i, ids in enumerate(ids_list):
+            labels[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+        labels = labels.masked_fill(labels == pad_id, -100)
+
+        return {
+            "input_signal": input_signal,                  # [B, T_max]
+            "input_signal_length": input_signal_length,    # [B]
+            "labels": labels,                              # [B, L_max]
+        }
+
+
+def my_compute_loss_ctc(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    processor=None,
+    blank_token_id=None,
+):
+    """
+    CTC Loss 계산 함수.
+    - logits: [batch_size, T, num_classes]
+    - labels: [batch_size, L] (패딩 토큰은 -100으로 표시)
+    - processor: Wav2Vec2Processor 등 (pad_token_id 획득용)
+    - blank_token_id: None일 경우 processor.tokenizer.pad_token_id 사용
+    """
+    if blank_token_id is None:
+        blank_token_id = processor.tokenizer.pad_token_id
+
+    # 1) log_softmax를 적용 → [batch_size, T, num_classes]
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+    # 2) CTCLoss는 [T, batch_size, num_classes] 형태를 기대하므로 transpose
+    log_probs = log_probs.transpose(0, 1)  # now [T, batch_size, num_classes]
+
+    batch_size, T, _ = logits.shape
+    device = logits.device
+
+    # 3) 레이블 길이 계산: -100이 아닌 토큰 개수
+    label_lengths = (labels != -100).sum(dim=1)  # [batch_size]
+
+    # 4) 실제 레이블을 concatenation하기 위해 -100 아닌 부분만 모으기
+    targets_list = [lab[lab != -100] for lab in labels]
+    targets_list = [t for t in targets_list if t.numel() > 0]
+    if targets_list:
+        targets = torch.cat(targets_list).to(device)  # [sum(label_lengths)]
+    else:
+        targets = torch.tensor([], dtype=torch.long, device=device)
+
+    # 5) 입력 길이는 모두 T로 동일 (CTCLoss 입력 인자)
+    input_lengths = torch.full(
+        size=(batch_size,),
+        fill_value=T,
+        dtype=torch.long,
+        device=device,
+    )
+
+    # 6) CTC 손실 함수
+    ctc_loss_fn = nn.CTCLoss(blank=blank_token_id, zero_infinity=True)
+
+    # 7) 손실 계산
+    loss = ctc_loss_fn(log_probs, targets, input_lengths, label_lengths)
+    return loss
+
+
+class Custom_Trainer(Trainer):
+    def __init__(self, processor, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.processor = processor
+
+    def compute_loss(
+        self,
+        model: torch.nn.Module,
+        inputs: Union[Dict[str, torch.Tensor], Tuple, list],
+        return_outputs: bool = False,
+        **kwargs
+    ):
+        """
+        - data_collator가 dict를 반환하므로 inputs는 항상 dict임을 가정합니다.
+        - (구 호환성으로 tuple/list 케이스도 처리)
+        """
+        if isinstance(inputs, (tuple, list)):
+            # tuple/list로 왔을 때: (input_signal, input_signal_length, labels, …)
+            input_signal, input_signal_length, labels = inputs[:3]
+        else:
+            # dict인 경우
+            labels = inputs.pop("labels")
+            input_signal = inputs.get("input_signal", None)
+            input_signal_length = inputs.get("input_signal_length", None)
+
+        # 모델 forward: EncDecCTCModel.forward(input_signal=…, input_signal_length=…)
+        outputs = model(
+            input_signal=input_signal,
+            input_signal_length=input_signal_length,
+        )
+        # forward의 반환값은 (log_probs, encoded_len, greedy_predictions)
+        log_probs = outputs[0]  # [B, T, D]
+
+        loss = my_compute_loss_ctc(
+            logits=log_probs,
+            labels=labels,
+            processor=self.processor,
+        )
+        return (loss, outputs) if return_outputs else loss
+
+    def prediction_step(
+        self,
+        model: torch.nn.Module,
+        inputs: Dict[str, torch.Tensor],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[list] = None,
+    ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """
+        평가/예측 단계에서 모델에 labels가 전달되지 않도록 하고,
+        (loss, logits, labels) 형태로 반환합니다.
+        """
+        # 1) inputs dict에서 labels 분리
+        labels = inputs.pop("labels", None)
+
+        # 2) 모델 forward (labels 없이)
+        outputs = model(
+            input_signal=inputs["input_signal"],
+            input_signal_length=inputs["input_signal_length"],
+        )
+        log_probs = outputs[0]  # [B, T, D]
+
+        # 3) logits만 반환 (Trainer의 compute_metrics에서 WER 계산용)
+        #    prediction_loss_only=True일 때는 loss만 필요하므로 None 처리
+        loss = None
+        if not prediction_loss_only:
+            # 필요한 경우 logits을 리턴
+            pass
+
+        return (loss, log_probs, labels)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Train halved-dimension Conformer CTC student on LibriSpeech 100h"
@@ -473,7 +608,7 @@ def main():
     parser.add_argument(
         "--final_finetune_epochs",
         type=int,
-        default=50,
+        default=100,
         help="최종 Pruning 이후 미세튜닝 epoch 수"
     )
     parser.add_argument(
@@ -548,6 +683,7 @@ def main():
             args.data_script_path,
             args.data_config_name,
             split=args.data_train_split,
+            streaming=False,
             trust_remote_code=True,
             download_config=dl_cfg,
             cache_dir=cache_dir,
@@ -556,6 +692,7 @@ def main():
             args.data_script_path,
             args.data_config_name,
             split=args.data_val_split,
+            streaming=False,
             trust_remote_code=True,
             download_config=dl_cfg,
             cache_dir=cache_dir,
@@ -564,6 +701,7 @@ def main():
             args.data_script_path,
             args.data_config_name,
             split=args.data_test_split,
+            streaming=False,
             trust_remote_code=True,
             download_config=dl_cfg,
             cache_dir=cache_dir,
@@ -575,9 +713,9 @@ def main():
         processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-100h", config=wav2vec2config)
         if args.test_mode:
             # test_mode일 때는 데이터셋을 100개로 제한
-            train_ds = train_ds.select(range(300))
-            val_ds = val_ds.select(range(300))
-            test_ds = test_ds.select(range(300))
+            train_ds = train_ds.select(range(100))
+            val_ds = val_ds.select(range(100))
+            test_ds = test_ds.select(range(100))
         train_ds = train_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
         val_ds = val_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
         test_ds = test_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
@@ -668,6 +806,8 @@ def main():
         trainer=trainer,
     )
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-base-960h")
+    wav2vec2config = Wav2Vec2Config.from_pretrained(args.model_name_or_path, output_attentions=True)
+    processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h", config=wav2vec2config)
     tokenizer = model.tokenizer   # Nemo BPE tokenizer
 
     collator  = ConformerCTCDataCollator(
@@ -716,10 +856,46 @@ def main():
     else:
         heads_to_keep = []
     
-    
+    def compute_metrics(pred):
+        pred_logits = pred.predictions
+        pred_ids = np.argmax(pred_logits, axis=-1)
+        # processor.decode를 이용해 토큰 id를 텍스트로 변환
+        if args.dataset == "librispeech":
+            pred_str = processor.batch_decode(pred_ids)
+            # 라벨도 문자열로 변환
+            label_ids = pred.label_ids
+            # 패딩(-100) 제거 및 문자열 변환
+            label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+            label_str = processor.batch_decode(label_ids, group_tokens=False)
+        elif args.dataset == "tedlium":
+            pred_str = processor.batch_decode(
+                pred_ids,
+                skip_special_tokens=True,
+                group_tokens=True,
+            )
+
+            # 레퍼런스(레이블) 디코딩: -100은 무시, 빈 토큰 제거
+            label_ids = pred.label_ids.copy()
+            # -100로 표시된 부분은 토크나이저가 skip_special_tokens로 알아서 무시하게 두거나,
+            # pad_token_id로 대체한 뒤 skip_special_tokens=True 로 지워지도록.
+            label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+            label_str = processor.batch_decode(
+                label_ids,
+                skip_special_tokens=True,
+                group_tokens=True,
+            )
+        else:
+            raise ValueError(f"Unknown dataset: {args.dataset}")
+        
+        wer_metric = load("wer")
+        wer = wer_metric.compute(predictions=pred_str, references=label_str)
+        # print(f'pred_str: {pred_str}')
+        # print(f'label_str: {label_str}')
+        return {"wer": wer}
     
     if args.method == "baseline":
         print("▶ Baseline pruning: no pruning applied.")
+        final_finetune_model = model
         pass
     elif args.method == "one-shot":
         print("▶ One-shot pruning: computing average attention …")
@@ -774,40 +950,58 @@ def main():
         heads_to_prune = build_prune_dict(layer_to_keep, init_num_layers, init_num_heads)
         print(f"▶ One-shot prune plan: {heads_to_prune}")
         prune_conformer_attention(model, heads_to_prune)
+        final_finetune_model = model
         print("▶ One-shot head pruning complete.")
-    else:
-        # # model 메모리 해제
-        # del model
-        # torch.cuda.empty_cache()
-        
+    else:    
         # iterative 과정을 통해 already_pruned_heads_dict 생성
+        iter_training_args = TrainingArguments(
+            output_dir=args.output_dir,
+            num_train_epochs=args.iterative_finetune_epochs,
+            per_device_train_batch_size=args.batch_size,
+            eval_strategy="epoch",
+            save_strategy="epoch",
+            learning_rate=1e-4,
+            fp16=True,  # GPU 사용 시
+            save_total_limit=1,
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_test_wer",
+            greater_is_better=False,
+            push_to_hub=False,
+            remove_unused_columns=False,
+        )
         for i in range(args.iterations):
-            trainer_i = pl.Trainer(
-                devices=args.gpus,
-                accelerator="gpu",
-                max_epochs=args.iterative_finetune_epochs,
-                default_root_dir=args.output_dir,
-                logger=wandb_logger,
-                # callbacks=[iterative_checkpoint_callback],
-            )
-            # model_i pruning 하고 short fine-tuning
             model_i = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
                 model_name=args.model_name_or_path,
                 map_location="cuda:0",
-                trainer=trainer_i,
+            )
+            
+            iter_trainer = Custom_Trainer(
+                model=model_i,
+                args=iter_training_args,
+                data_collator=collator,
+                train_dataset=train_ds,  # 준비된 데이터셋
+                eval_dataset=val_ds,  # 평가용 데이터셋
+                processing_class=processor,
+                processor=processor,
+                compute_metrics=compute_metrics,
+                compute_loss_func=my_compute_loss_ctc,
             )
             setup_nemo_datasets_and_cfg(
                 model_i, train_ds, val_ds, test_ds, collator,
                 train_manifest, val_manifest, test_manifest, args
             )
 
-            print(f' - {i+1}번째 itertaion pruning 할 head : {already_pruned_heads_dict}')
+            print(f' - {i+1}번째 itertaion에서는 다음과 같이 pruning 합니다. already_pruned_heads_dict : {already_pruned_heads_dict}')
             prune_conformer_attention(model_i, already_pruned_heads_dict)
             
-            _orig = wandb_logger.log_hyperparams
-            wandb_logger.log_hyperparams = lambda *args, **kwargs: None
-            trainer_i.fit(model_i)
-            wandb_logger.log_hyperparams = _orig
+            # _orig = wandb_logger.log_hyperparams
+            # wandb_logger.log_hyperparams = lambda *args, **kwargs: None
+            print(f" - Iteration {i+1} Fine-Tuning 시작")
+            iter_trainer.train()
+            eval_metrics = iter_trainer.evaluate()
+            print(f" - Iteration {i+1} 평가 결과(WER): {eval_metrics['eval_test_wer']:.4f}")
+            iter_trainer.save_model(args.output_dir + f'/{i+1}iteration_pruned_model')
+            # wandb_logger.log_hyperparams = _orig
             
             # 다음 iteration에서 제거할 헤드 추가
             if args.method == "redundancy-based":
@@ -833,9 +1027,6 @@ def main():
                 )
                 current_num_heads = find_remaining_heads(already_pruned_heads_dict, init_num_total_heads)
                 print(f" - 현재 남아있는 전체 헤드 수: {current_num_heads}")            
-                del model_i
-                del trainer_i
-                torch.cuda.empty_cache()
                 
                 for (lyr_idx, h_idx) in remove_candidates:
                     if h_idx in already_pruned_heads_dict[lyr_idx]:
@@ -961,7 +1152,8 @@ def main():
                     already_pruned_heads_dict[lyr_idx].add(h_idx)
             else:
                 raise ValueError(f"Unknown method: {args.method}")
-            
+        
+            print(f" - {i+1}번째 iteration 완료. 다음 iteration을 위한 현재 already_pruned_heads_dict: {already_pruned_heads_dict}")
         
         
         trainer = pl.Trainer(
@@ -974,7 +1166,7 @@ def main():
         )
         
         # 최종 모델 구조 선언
-        model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
+        final_finetune_model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
             model_name=args.model_name_or_path,
             map_location="cuda:0",
             trainer=trainer,
@@ -987,106 +1179,151 @@ def main():
         prune_conformer_attention(model, already_pruned_heads_dict)
     
     # Stage 4: Final Fine-tuning
-    _orig = wandb_logger.log_hyperparams
-    wandb_logger.log_hyperparams = lambda *args, **kwargs: None
-    trainer.fit(model)
-    wandb_logger.log_hyperparams = _orig
+    # _orig = wandb_logger.log_hyperparams
+    # wandb_logger.log_hyperparams = lambda *args, **kwargs: None
+    # trainer.fit(model)
+    # wandb_logger.log_hyperparams = _orig
+    print("\n[모든 Iteration 종료]")
+    print("최종 프루닝 완료 후 모델 저장/사용 등 후속 작업을 진행하세요.")
+
+    # 필요한 경우 최종 모델 저장
+    iter_trainer.save_model(args.output_dir + "/final_pruned_model")
+
     
-    # 학습한 모델 저장
-    best_ckpt = checkpoint_callback.best_model_path
-    nemo_out  = os.path.join(args.output_dir, exp_name, f"result_weight_{exp_name}.nemo")
-    save_weights_only_nemo(model, best_ckpt, nemo_out)
-    print(f"✅ Saved weights‐only .nemo to {nemo_out}")
+    ### Stage 4. Final Fine-Tuning
+    # 저장한 최종 모델로 최종 fine-tuning
+    # final_finetune_model = init_model # 여기선 deepcopy 굳이 안씀
+    final_finetune_model.config.output_attentions = False
+    
+    print("\n[최종 Fine-tuning 시작]")
+    # 최종 fine-tuning을 위한 Trainer 설정
+    training_args_2 = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.final_finetune_epochs,
+        per_device_train_batch_size=args.batch_size,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        learning_rate=1e-4,
+        fp16=True,  # GPU 사용 시
+        save_total_limit=4,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_test_wer",
+        greater_is_better=False,
+        push_to_hub=False,
+        remove_unused_columns=False,
+    )
+    trainer_2 = Custom_Trainer(
+        model=final_finetune_model,
+        args=training_args_2,
+        data_collator=collator,
+        train_dataset=train_ds,  # 준비된 데이터셋
+        eval_dataset=val_ds,  # 평가용 데이터셋
+        processing_class=processor,
+        processor=processor,
+        compute_metrics=compute_metrics,
+        compute_loss_func=my_compute_loss_ctc,
+    )
+
+    # 최종 fine-tuning 실행
+    trainer_2.train()
+
+    print("\n[모든 작업 완료]")
+    
+    # # 학습한 모델 저장
+    # best_ckpt = checkpoint_callback.best_model_path
+    # nemo_out  = os.path.join(args.output_dir, exp_name, f"result_weight_{exp_name}.nemo")
+    # save_weights_only_nemo(model, best_ckpt, nemo_out)
+    # print(f"✅ Saved weights‐only .nemo to {nemo_out}")
     
     
-    # Stage 5: Evaluation
-    # ================================
-    # Stage 5: Evaluation
-    # ================================
-    # 1) 평가할 split 이름과 load_dataset 파라미터 분기
-    MAX_SAMPLES = 160000  # 20초
-    if args.dataset_name == "librispeech":
-        split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
-        script       = args.data_script_path
-        config_name  = args.data_config_name
-        load_kwargs = {
-            "path":       script,
-            "name":       config_name,
-            "trust_remote_code": True,
-            "download_config":   dl_cfg,
-            "cache_dir":  cache_dir,
-        }
-    else:  # tedlium
-        split_names = ["dev", "test"]
-        # tedlium test split load
-        load_kwargs = {
-            "path":       "./tedlium_test.py",
-            "name":       "release1",
-            "trust_remote_code": True,
-        }
+    # # Stage 5: Evaluation
+    # # ================================
+    # # Stage 5: Evaluation
+    # # ================================
+    # # 1) 평가할 split 이름과 load_dataset 파라미터 분기
+    # MAX_SAMPLES = 160000  # 20초
+    # if args.dataset_name == "librispeech":
+    #     split_names = ["dev.clean", "dev.other", "test.clean", "test.other"]
+    #     script       = args.data_script_path
+    #     config_name  = args.data_config_name
+    #     load_kwargs = {
+    #         "path":       script,
+    #         "name":       config_name,
+    #         "trust_remote_code": True,
+    #         "download_config":   dl_cfg,
+    #         "cache_dir":  cache_dir,
+    #     }
+    # else:  # tedlium
+    #     split_names = ["dev", "test"]
+    #     # tedlium test split load
+    #     load_kwargs = {
+    #         "path":       "./tedlium_test.py",
+    #         "name":       "release1",
+    #         "trust_remote_code": True,
+    #     }
 
-    metrics = {}
-    for split_name in split_names:
-        print(f"\n===== Evaluating on split: {split_name} =====")
-        model.eval()
+    # metrics = {}
+    # for split_name in split_names:
+    #     print(f"\n===== Evaluating on split: {split_name} =====")
+    #     model.eval()
 
-        # 2) 테스트 데이터셋 로드 & (필요시) 필터 & 전처리
-        test_i_ds = load_dataset(
-            load_kwargs["path"],
-            load_kwargs["name"],
-            split=split_name,
-            **{k:v for k,v in load_kwargs.items() if k not in ["path","name"]}
-        )
-        if args.dataset_name == "tedlium":
-            # 최대 길이 필터 (10초)
-            test_i_ds = test_i_ds.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
-            test_i_ds = test_i_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
+    #     # 2) 테스트 데이터셋 로드 & (필요시) 필터 & 전처리
+    #     test_i_ds = load_dataset(
+    #         load_kwargs["path"],
+    #         load_kwargs["name"],
+    #         split=split_name,
+    #         **{k:v for k,v in load_kwargs.items() if k not in ["path","name"]}
+    #     )
+    #     if args.dataset_name == "tedlium":
+    #         # 최대 길이 필터 (10초)
+    #         test_i_ds = test_i_ds.filter(lambda x: x["audio"]["array"].shape[0] <= MAX_SAMPLES)
+    #         test_i_ds = test_i_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
 
-        if args.test_mode:
-            test_i_ds = test_i_ds.select(range(300))
+    #     if args.test_mode:
+    #         test_i_ds = test_i_ds.select(range(300))
 
-        # 3) manifest 파일 생성
-        json_name = split_name.replace(".", "_") + ".json"
-        manifest_i = os.path.join(manifest_dir, json_name)
-        build_manifest_from_hf(test_i_ds, manifest_i, cache_dir)
+    #     # 3) manifest 파일 생성
+    #     json_name = split_name.replace(".", "_") + ".json"
+    #     manifest_i = os.path.join(manifest_dir, json_name)
+    #     build_manifest_from_hf(test_i_ds, manifest_i, cache_dir)
 
-        # 4) NeMo 테스트 데이터 설정
-        test_cfg = deepcopy(model.cfg.test_ds)
-        test_cfg.manifest_filepath = manifest_i
-        test_cfg.shuffle = False
-        model.setup_test_data(test_cfg)
-        dl = model.test_dataloader()
+    #     # 4) NeMo 테스트 데이터 설정
+    #     test_cfg = deepcopy(model.cfg.test_ds)
+    #     test_cfg.manifest_filepath = manifest_i
+    #     test_cfg.shuffle = False
+    #     model.setup_test_data(test_cfg)
+    #     dl = model.test_dataloader()
         
-        _orig_log_hparams = wandb_logger.log_hyperparams
-        wandb_logger.log_hyperparams = lambda *args, **kwargs: None
+    #     _orig_log_hparams = wandb_logger.log_hyperparams
+    #     wandb_logger.log_hyperparams = lambda *args, **kwargs: None
 
-        results = trainer.test(
-            model=model,
-            dataloaders=[dl],
-            ckpt_path=best_ckpt or None,
-            verbose=True,
-        )
-        wandb_logger.log_hyperparams = _orig_log_hparams
+    #     results = trainer.test(
+    #         model=model,
+    #         dataloaders=[dl],
+    #         ckpt_path=best_ckpt or None,
+    #         verbose=True,
+    #     )
+    #     wandb_logger.log_hyperparams = _orig_log_hparams
         
-        # trainer.test 는 리스트(dict) 반환, 첫 번째 원소에서 메트릭 추출
-        res   = results[0]
-        wer   = res.get("test_wer", res.get("wer", None))
-        loss  = res.get("test_loss", res.get("loss", None))
-        print(f"  → split={split_name} | loss={loss:.4f} | wer={wer:.2%}")
+    #     # trainer.test 는 리스트(dict) 반환, 첫 번째 원소에서 메트릭 추출
+    #     res   = results[0]
+    #     wer   = res.get("test_wer", res.get("wer", None))
+    #     loss  = res.get("test_loss", res.get("loss", None))
+    #     print(f"  → split={split_name} | loss={loss:.4f} | wer={wer:.2%}")
         
-        # ① 메트릭 키에 split 이름을 붙여서 Wandb에 기록
-        # #    dev.clean  → dev_clean/wer, dev_clean/loss
-        key_prefix = split_name.replace(".", "_")
-        metric = {
-            f"{key_prefix}/wer":  wer,
-            f"{key_prefix}/loss": loss,
-        }
-        metrics[f"{key_prefix}/wer"] = wer
-        metrics[f"{key_prefix}/loss"] = loss
-        # ② step을 epoch 기반으로 찍거나 global_step 을 사용
-        wandb_logger.log_metrics(metric, step=trainer.current_epoch)
-    print(f"metrics: {metrics}")
-    wandb_logger.log_metrics(metrics, step=trainer.current_epoch)
+    #     # ① 메트릭 키에 split 이름을 붙여서 Wandb에 기록
+    #     # #    dev.clean  → dev_clean/wer, dev_clean/loss
+    #     key_prefix = split_name.replace(".", "_")
+    #     metric = {
+    #         f"{key_prefix}/wer":  wer,
+    #         f"{key_prefix}/loss": loss,
+    #     }
+    #     metrics[f"{key_prefix}/wer"] = wer
+    #     metrics[f"{key_prefix}/loss"] = loss
+    #     # ② step을 epoch 기반으로 찍거나 global_step 을 사용
+    #     wandb_logger.log_metrics(metric, step=trainer.current_epoch)
+    # print(f"metrics: {metrics}")
+    # wandb_logger.log_metrics(metrics, step=trainer.current_epoch)
     
 if __name__ == "__main__":
     main()
