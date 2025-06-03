@@ -14,6 +14,7 @@ python train_conformer_IRHP_libri.py \
 --data_val_split dev.clean \
 --data_test_split test.clean \
 --batch_size 32 \
---epochs 100 \
---method "mag-based" \
+--final_finetune_epochs 100 \
+--method "magnitude-based" \
 --prune_ratio 0.5 \
+--dataset_name librispeech \
