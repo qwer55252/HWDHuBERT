@@ -972,7 +972,7 @@ def main():
                     already_pruned_heads_dict[lyr_idx].add(h_idx)
             else:
                 raise ValueError(f"Unknown method: {args.method}")
-            
+            print(f" - {i+1}번째 iteration 최종 already_pruned_head_dict: {already_pruned_heads_dict}")
         
         
         trainer = pl.Trainer(
