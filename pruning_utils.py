@@ -375,7 +375,9 @@ def pad_attention_tensors_to_max(avg_attn_per_layer, model_config, already_prune
     return padded_tensors
 
 def get_avg_attention_matrices(model, dataset, data_collator, sample_size=10, already_pruned_heads=None):
-    model.eval()
+    device_before = next(model.parameters()).device
+    model.cpu().eval()
+    # model.eval()
     collected = []
 
     # 1) Conformer 블록을 직접 순회하며 hook 등록
@@ -424,6 +426,9 @@ def get_avg_attention_matrices(model, dataset, data_collator, sample_size=10, al
 
     # 5) 기존 padding 로직 재사용
     padded = pad_attention_tensors_to_max(avg_attn_per_layer, model.cfg, already_pruned_heads)
+    
+    model.to(device_before)
+    
     return padded
 
 

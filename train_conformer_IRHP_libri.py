@@ -825,11 +825,14 @@ def main():
                 # 2) 평균 어텐션 계산 (train_ds에서 랜덤 샘플)
                 avg_attn_matrices = get_avg_attention_matrices(
                     model_i, 
-                    dataset=train_ds,   # batch마다 model(**batch, output_attentions=True) 필요
+                    dataset=train_ds.select(range(1)),   # batch마다 model(**batch, output_attentions=True) 필요
                     data_collator=collator,
-                    sample_size=10,
+                    sample_size=1,
                     already_pruned_heads=already_pruned_heads_dict
                 )
+                del model_i
+                del trainer_i
+                torch.cuda.empty_cache()
 
                 # 4) 클러스터링으로 제거할 헤드 선정
                 n_remove = heads_to_remove_per_iter
