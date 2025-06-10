@@ -516,7 +516,7 @@ def main():
 
     # manifest 경로 설정
     os.makedirs(args.output_dir, exist_ok=True)
-    manifest_dir = os.path.join(args.data_dir, "manifests")
+    manifest_dir = os.path.join(args.data_dir, f"manifests_{args.dataset_name}_{args.data_config_name}")
     os.makedirs(manifest_dir, exist_ok=True)
     # train_manifest = os.path.join(args.data_dir, "manifests", "train-clean-100.json")
     # val_manifest = os.path.join(args.data_dir, "manifests", "validation.json")
@@ -536,7 +536,7 @@ def main():
         max_retries=10,
         disable_tqdm=False,
         download_desc="Downloading LibriSpeech ASR",
-        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=3600)}},
+        storage_options={"client_kwargs": {"timeout": aiohttp.ClientTimeout(total=10800)}},
         delete_extracted=False,
         extract_compressed_file=True,
         force_extract=True,            

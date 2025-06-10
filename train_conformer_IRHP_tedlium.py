@@ -102,43 +102,39 @@ def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str):
     """
     os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
 
+    # 기본 HF_DATASETS_CACHE (원본 오디오가 풀리던 위치)
+    default_root = config.HF_DATASETS_CACHE
+    extract_marker = os.path.join("extracted")
+
+    # with open(manifest_path, "w") as fout:
+    #     for sample in ds:
+    #         audio = sample["audio"]
+    #         orig_path = audio["path"] 
+    #         # sample["audio"]["path"] : '/workspace/data/cache/extracted/28e1f76d85906acbe5672f913bb405be336b2a2aa63d4db4a3d1546fd2728272/2277-149896-0000.flac'
+    #         # 실제 데이터 경로 : '/workspace/data/cache/extracted/28e1f76d85906acbe5672f913bb405be336b2a2aa63d4db4a3d1546fd2728272/LibriSpeech/dev-clean/2277/149896/2277-149896-0000.flac'
+            
+
+    #         duration = len(audio["array"]) / audio["sampling_rate"]
+    #         entry = {
+    #             "audio_filepath": orig_path,  # 실제로 존재하는 절대/상대 경로
+    #             "duration": duration,
+    #             "text": sample["text"].lower().strip(),
+    #         }
+    #         fout.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
     # HF가 flac을 풀어놓는 최상위 디렉토리
     extract_root = os.path.join(cache_dir, "extracted")
 
-    # 오디오를 임시로 저장할 디렉토리 (orig_path가 None일 때 사용)
-    temp_audio_dir = os.path.join(cache_dir, "audio_temp")
-    os.makedirs(temp_audio_dir, exist_ok=True)
+    with open(manifest_path, "w") as fout:
+        for sample in ds:
+            audio     = sample["audio"]
+            orig_path = sample["file"]  # HF가 알려준 경로 (존재하지 않을 수도 있음)
 
-    with open(manifest_path, "w", encoding="utf-8") as fout:
-        for idx, sample in enumerate(ds):
-            audio = sample["audio"]
-            orig_path = audio.get("path", None)  # HuggingFace에서 준 경로 (None일 수 있음)
-
-            # ────────────────────────────────────────────────────────────────
-            #  1) orig_path가 None이거나 빈 문자열("")이라면
-            #     -> 메모리상의 numpy array를 실제 WAV 파일로 저장
-            if not orig_path:
-                # audio["array"]: numpy array, audio["sampling_rate"]: int
-                arr = audio["array"]
-                sr = audio["sampling_rate"]
-
-                # 임시 저장할 파일명 예: {temp_audio_dir}/sample_{idx}.wav
-                tmp_fname = f"sample_{idx}.wav"
-                tmp_path = os.path.join(temp_audio_dir, tmp_fname)
-
-                # 이미 같은 이름의 파일이 있으면 덮어쓰기x. 
-                # (매번 덮어쓰기하면 ds에 같은 idx가 반복될 때 갱신될 수 있음)
-                if not os.path.isfile(tmp_path):
-                    sf.write(tmp_path, arr, sr)
-
-                orig_path = tmp_path
-            # ────────────────────────────────────────────────────────────────
-
-            # ────────────────────────────────────────────────────────────────
-            #  2) orig_path가 None이 아니어도, 실제로 파일이 존재하는지 확인
+            # 1) 첫 시도: orig_path 에 파일이 실제로 존재하는지
             if not os.path.isfile(orig_path):
                 filename = os.path.basename(orig_path)
-                # fallback: extract_root 이하를 재귀 검색
+                # 2) fallback: extract_root 이하를 재귀 검색
                 pattern = os.path.join(extract_root, "**", filename)
                 matches = glob.glob(pattern, recursive=True)
                 if not matches:
@@ -149,7 +145,6 @@ def build_manifest_from_hf(ds, manifest_path: str, cache_dir: str):
                     )
                 # 검색 결과 중 첫 번째를 사용
                 orig_path = matches[0]
-            # ────────────────────────────────────────────────────────────────
 
             duration = len(audio["array"]) / audio["sampling_rate"]
             entry = {
@@ -422,31 +417,31 @@ def main():
     parser.add_argument(
         "--data_script_path",
         type=str,
-        default="./librispeech_asr.py",
+        default="./tedlium_test.py",
         help="HuggingFace LibriSpeech 데이터 스크립트 경로",
     )
     parser.add_argument(
         "--data_config_name",
         type=str,
-        default="train_100",
+        default="release1",
         help="_DL_URLS 키값 설정(train_100 등)",
     )
     parser.add_argument(
         "--data_train_split",
         type=str,
-        default="train.clean.100",
+        default="train",
         help="훈련 split 이름",
     )
     parser.add_argument(
         "--data_val_split",
         type=str,
-        default="dev.clean",
+        default="validation",
         help="평가 split 이름",
     )
     parser.add_argument(
         "--data_test_split",
         type=str,
-        default="test.clean",
+        default="test",
         help="평가 split 이름",
     )
     parser.add_argument(
@@ -512,7 +507,7 @@ def main():
     parser.add_argument(
         "--prune_ratio",
         type=float,
-        default=0.8,
+        default=0.5,
         help="전체 헤드 중 제거할 비율 (0.0 ~ 1.0)"
     )
     parser.add_argument(
@@ -569,49 +564,40 @@ def main():
         force_extract=True,            
     )
     
-    if args.dataset_name == "librispeech":
-        train_ds = load_dataset(
-            args.data_script_path,
-            args.data_config_name,
-            split=args.data_train_split,
-            trust_remote_code=True,
-            download_config=dl_cfg,
-            cache_dir=cache_dir,
-        )
-        val_ds = load_dataset(
-            args.data_script_path,
-            args.data_config_name,
-            split=args.data_val_split,
-            trust_remote_code=True,
-            download_config=dl_cfg,
-            cache_dir=cache_dir,
-        )
-        test_ds = load_dataset(
-            args.data_script_path,
-            args.data_config_name,
-            split=args.data_test_split,
-            trust_remote_code=True,
-            download_config=dl_cfg,
-            cache_dir=cache_dir,
-        )
-    
-    elif args.dataset_name == "tedlium":
-        train_ds, val_ds, test_ds = load_datasets(dataset_name=args.dataset_name)
-        wav2vec2config = Wav2Vec2Config.from_pretrained("facebook/wav2vec2-base-100h", output_attentions=True)
-        processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-100h", config=wav2vec2config)
-        if args.test_mode:
-            # test_mode일 때는 데이터셋을 100개로 제한
-            train_ds = train_ds.select(range(300))
-            val_ds = val_ds.select(range(300))
-            test_ds = test_ds.select(range(300))
-        train_ds = train_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
-        val_ds = val_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
-        test_ds = test_ds.map(preprocess_function, fn_kwargs={"processor": processor}, num_proc=4)
-        
-    eval_datasets = {"dev": val_ds, "test": test_ds} # TODO: 정상작동하는지 확인
-    
+    train_ds = load_dataset(
+        args.data_script_path,
+        args.data_config_name,
+        split=args.data_train_split,
+        trust_remote_code=True,
+        download_config=dl_cfg,
+        cache_dir=cache_dir,
+    )
+    val_ds = load_dataset(
+        args.data_script_path,
+        args.data_config_name,
+        split=args.data_val_split,
+        trust_remote_code=True,
+        download_config=dl_cfg,
+        cache_dir=cache_dir,
+    )
+    test_ds = load_dataset(
+        args.data_script_path,
+        args.data_config_name,
+        split=args.data_test_split,
+        trust_remote_code=True,
+        download_config=dl_cfg,
+        cache_dir=cache_dir,
+    )
     print(f'train_ds.cache_files: {train_ds.cache_files}')  # [{'filename': '/home/you/.cache/huggingface/datasets/.../train.arrow', ...}, ...]
     # 2) NeMo manifest 생성
+    
+    if args.test_mode: # 100개 데이터만 사용
+        train_ds = train_ds.select(range(100))
+        val_ds = val_ds.select(range(100))
+        test_ds = test_ds.select(range(100))
+        
+        args.final_finetune_epochs = 5
+        args.iterative_finetune_epochs = 1
 
     print("building manifest files...")
     if not os.path.isfile(train_manifest):
@@ -625,50 +611,32 @@ def main():
         print(f"test_manifest DONE: {test_manifest}")
     print("manifest files built.")
     
-    # test_mode일 때는 별도의 작은 manifest 파일을 생성
-    if args.test_mode:
-        train_ds = train_ds.select(range(300))
-        val_ds = val_ds.select(range(300))
-        test_ds = test_ds.select(range(300))
-        args.iterative_finetune_epochs = 1
-        args.final_finetune_epochs = 2
-
-        # test_mode용 manifest 경로
-        test_train_manifest = os.path.join(manifest_dir, "train_testmode.json")
-        test_val_manifest = os.path.join(manifest_dir, "val_testmode.json")
-        test_test_manifest = os.path.join(manifest_dir, "test_testmode.json")
-
-        # 항상 새로 생성 (작으니 시간 부담 없음)
-        build_manifest_from_hf(train_ds, test_train_manifest, cache_dir)
-        build_manifest_from_hf(val_ds, test_val_manifest, cache_dir)
-        build_manifest_from_hf(test_ds, test_test_manifest, cache_dir)
-
-        # 이후 코드에서 사용할 manifest 경로를 test_mode용으로 교체
-        train_manifest = test_train_manifest
-        val_manifest = test_val_manifest
-        test_manifest = test_test_manifest
         
+
+    # 3) W&B logger 생성
+    os.makedirs(os.path.join(args.output_dir, "iterative"), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, "final_finetune"), exist_ok=True)
+    exp_name = os.getenv("EXP_NAME")
+    
+    last_checkpoint_callback = ModelCheckpoint(
+        dirpath=os.path.join(args.output_dir, "final_finetune"),
+        filename="last",
+        save_top_k=0,
+        verbose=True,
+        save_last=True,
+    )
+    best_checkpoint_callback = ModelCheckpoint(
+        dirpath=os.path.join(args.output_dir, "final_finetune"),
+        filename="best",
+        save_top_k=2,
+        verbose=True,
+        monitor="val_wer",
+        mode="min",
+    )
 
     # 3) W&B logger 생성
     prj_name = os.getenv("PRJ_NAME")
     exp_name = os.getenv("EXP_NAME")
-    iterative_checkpoint_callback = ModelCheckpoint(
-        dirpath=args.output_dir,
-        filename="best",
-        save_top_k=1,
-        verbose=True,
-        monitor="val_loss",
-        mode="min",
-    )
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=args.output_dir,
-        filename="best",
-        save_top_k=1,
-        verbose=True,
-        monitor="val_loss",
-        mode="min",
-    )
-
     # 4) PyTorch Lightning Trainer
     cfg_dict = vars(args)
     wandb_logger = WandbLogger(
@@ -683,7 +651,7 @@ def main():
         max_epochs=args.final_finetune_epochs,
         default_root_dir=args.output_dir,
         logger=wandb_logger,
-        callbacks=[checkpoint_callback],
+        callbacks=[last_checkpoint_callback, best_checkpoint_callback],
     )
     
 
@@ -694,6 +662,8 @@ def main():
     )
     feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained("facebook/wav2vec2-base-960h")
     tokenizer = model.tokenizer   # Nemo BPE tokenizer
+    wav2vec2config = Wav2Vec2Config.from_pretrained("facebook/wav2vec2-base-100h", output_attentions=True)
+    processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-100h", config=wav2vec2config)
 
     collator  = ConformerCTCDataCollator(
         feature_extractor=feature_extractor,
@@ -707,10 +677,32 @@ def main():
     
 
     # 새로운 manifest 경로로 덮어쓰기
-    setup_nemo_datasets_and_cfg(
-        model, train_ds, val_ds, test_ds, collator,
-        train_manifest, val_manifest, test_manifest, args
-    )
+    model.cfg.train_ds.is_tarred = False # manifest_filepath 기반으로 데이터 Load하기 위한 설정
+    model.cfg.train_ds.tarred_audio_filepaths = None
+    model.cfg.train_ds.manifest_filepath      = train_manifest
+    model.cfg.train_ds.sample_rate            = args.data_sample_rate
+    model.cfg.train_ds.batch_size             = args.batch_size
+
+    model.cfg.validation_ds.is_tarred = False
+    model.cfg.validation_ds.tarred_audio_filepaths = None
+    model.cfg.validation_ds.manifest_filepath = val_manifest
+    model.cfg.validation_ds.sample_rate       = args.data_sample_rate
+    model.cfg.validation_ds.batch_size        = args.batch_size
+    
+    
+    model.cfg.test_ds.is_tarred = False
+    model.cfg.test_ds.tarred_audio_filepaths = None
+    model.cfg.test_ds.manifest_filepath       = test_manifest
+    model.cfg.test_ds.sample_rate             = args.data_sample_rate
+    model.cfg.test_ds.batch_size              = args.batch_size
+    
+    model.train_dataset = train_ds
+    model.val_dataset = val_ds
+    model.test_dataset = test_ds
+    model.batch_size = args.batch_size
+    model.data_collator = collator
+    
+    model.setup_training_data(model.cfg.train_ds) 
     
     # 파이썬에서 Nemo API로 풀어두는 함수 실행
     release_nemoAPI(model)
@@ -807,13 +799,20 @@ def main():
         
         # iterative 과정을 통해 already_pruned_heads_dict 생성
         for i in range(args.iterations):
+            iter_last_checkpoint_callback = ModelCheckpoint(
+                dirpath=os.path.join(args.output_dir, "iterative"),
+                filename=f"iter_{i+1}_last",
+                save_top_k=0,
+                verbose=True,
+                save_last=True,
+            )
             trainer_i = pl.Trainer(
                 devices=args.gpus,
                 accelerator="gpu",
                 max_epochs=args.iterative_finetune_epochs,
                 default_root_dir=args.output_dir,
                 logger=wandb_logger,
-                # callbacks=[iterative_checkpoint_callback],
+                callbacks=[iter_last_checkpoint_callback],
             )
             # model_i pruning 하고 short fine-tuning
             model_i = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
@@ -995,7 +994,7 @@ def main():
             max_epochs=args.final_finetune_epochs,
             default_root_dir=args.output_dir,
             logger=wandb_logger,
-            callbacks=[checkpoint_callback],
+            callbacks=[best_checkpoint_callback, last_checkpoint_callback],
         )
         
         # 최종 모델 구조 선언
@@ -1017,11 +1016,10 @@ def main():
     trainer.fit(model)
     wandb_logger.log_hyperparams = _orig
     
-    # 학습한 모델 저장
-    best_ckpt = checkpoint_callback.best_model_path
-    nemo_out  = os.path.join(args.output_dir, exp_name, f"result_weight_{exp_name}.nemo")
-    save_weights_only_nemo(model, best_ckpt, nemo_out)
-    print(f"✅ Saved weights‐only .nemo to {nemo_out}")
+    # 학습이 모두 끝난 후, “마지막 가중치”를 final.ckpt로 덮어쓰거나 별도 저장
+    final_epoch_ckpt_path = os.path.join(args.output_dir, "final_epoch.ckpt")
+    trainer.save_checkpoint(final_epoch_ckpt_path)
+    print(f"✅ Final checkpoint saved to {final_epoch_ckpt_path}")
     
     
     # Stage 5: Evaluation
@@ -1088,7 +1086,7 @@ def main():
         results = trainer.test(
             model=model,
             dataloaders=[dl],
-            ckpt_path=best_ckpt or None,
+            ckpt_path=final_epoch_ckpt_path or None,
             verbose=True,
         )
         wandb_logger.log_hyperparams = _orig_log_hparams
